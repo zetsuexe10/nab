@@ -1,6 +1,6 @@
 # snag
 
-Search YouTube from the terminal, pick a stream, and snag it. One small Rust binary:
+Search YouTube or xHamster from the terminal, pick a stream, and snag it. One small Rust binary:
 a full-screen picker, audio or video saved under clean names, and playback through
 mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
 
@@ -22,6 +22,12 @@ mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
 
 - One flow: search or paste a link, pick a result, pick a format from the Download panel,
   watch the progress bar. A pasted YouTube link skips the search.
+- Two sites: YouTube and xHamster. `ctrl+s` switches, `--site` picks one, and a pasted
+  link picks the site for you. xHamster videos list two stream sources, `initials` and
+  `page source`, and `tab` switches between them.
+- Search suggestions drop down as you type, with creators, channels and pornstars marked.
+  Picking a person opens a profile screen with their details and a paged, sortable list
+  of videos. `o` on a result or in the formats opens the uploader's profile.
 - Mouse works everywhere: buttons, rows, hints, the logo and the scroll wheel.
 - Search history on `↑`, a YouTube link in your clipboard offered on `tab`, and auto,
   light and dark themes on `ctrl+t`.
@@ -76,18 +82,27 @@ snag https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | Where | Key | Action |
 | --- | --- | --- |
 | search | `enter` | search, or open a pasted link |
-| search | `↑` `↓` | walk through earlier searches; `↓` with none to recall jumps to the results |
-| search | `tab` | paste the YouTube link from the clipboard, or jump to the results |
+| search | `↓` `↑` | walk through the suggestions, `enter` takes one, `esc` closes them |
+| search | `↑` `↓` | with no suggestions open, walk through earlier searches or jump to the results |
+| search | `tab` | fill the highlighted suggestion, paste the clipboard link, or jump to the results |
+| search | `ctrl+s` | switch between YouTube and xHamster |
 | search | `←` `→` `home` `end` | move the cursor |
 | search | `ctrl+u` `ctrl+w` `ctrl+k` | clear, delete word, delete to end |
 | search | `esc` | jump to the results (quits when there are none) |
 | results | `j` `k` `↑` `↓` | move; `pgup` `pgdn` jump; `g` `G` first and last |
 | results | `enter` | show the formats |
+| results | `o` | open the uploader's profile, when the site has one |
 | results | `/` `esc` | edit the query |
+| profile | `j` `k` `↑` `↓` | move; `pgup` `pgdn` jump; `g` `G` first and last |
+| profile | `enter` | show the formats of the highlighted video |
+| profile | `←` `→` or `p` `n` | previous and next page |
+| profile | `s` | cycle the sort: featured, newest, best, most viewed, most commented |
+| profile | `esc` | back to where you came from |
 | formats | `enter` | download the highlighted format |
 | formats | `p` | play it with the current player |
 | formats | `m` / `v` | play with mpv / vlc, and keep that choice |
-| formats | `tab` | switch source (innertube, ytultra) |
+| formats | `tab` | switch source (innertube, ytultra, initials, page source) |
+| formats | `o` | open the uploader's profile |
 | formats | `esc` | back |
 | download | `esc` | cancel (not while merging) |
 | done | `enter` | snag another |
@@ -104,7 +119,7 @@ without a new search. The Download panel lists videos first and then audio, each
 size. The line next to it says whether a video gets a matching audio track merged in or is
 ready as is.
 
-The theme and the search history are remembered in `~/.config/snag` (`%APPDATA%\snag` on
+The theme, the site and the search history are remembered in `~/.config/snag` (`%APPDATA%\snag` on
 Windows). `SNAG_CONFIG_DIR` moves that folder and `--theme auto|light|dark` overrides the
 theme for one run. `auto` uses your terminal's own colours.
 
@@ -117,6 +132,8 @@ snag --video "koyaanisqatsi"                      # save the first result as mp4
 snag --video --quality 480p "koyaanisqatsi"       # pick a height
 snag --play "koyaanisqatsi"                       # listen now, no file
 snag --play --video --player vlc "koyaanisqatsi"  # watch now, in vlc
+snag --site xhamster --list "some query"          # search the other site
+snag https://xhamster.com/creators/some-creator --list  # a profile's videos
 snag --audio --out ~/Music "koyaanisqatsi"        # choose the folder
 ```
 
@@ -129,6 +146,7 @@ The saved path is printed on stdout, progress on stderr.
 | `-q`, `--quality <height>` | 144p, 240p, 360p, 480p, 720p and up |
 | `-p`, `--play` | play instead of saving |
 | `--player <name>` | `mpv` or `vlc` |
+| `--site <name>` | `youtube` or `xhamster` |
 | `--theme <mode>` | `auto`, `light` or `dark` |
 | `-o`, `--out <dir>` | output folder |
 | `-n`, `--limit <count>` | results to show, default 20 |
@@ -195,12 +213,34 @@ Other converter sites were tried and left out: their links are signed or encrypt
 browser-only JavaScript and are not usable from a plain HTTP client. Download only
 material you have the rights to.
 
+## xHamster
+
+Pages embed their data as `window.initials`. The `initials` source reads the stream
+list out of it; media links there are either plain or XOR-ciphered with one of seven
+keystream generators, and snag deciphers them and drops decoys that do not decode to a
+playable URL. The `page source` source scrapes the raw HTML for mp4 and m3u8 links
+instead, so one still works when the other breaks.
+
+- Progressive mp4 goes up to 720p; taller sizes come as HLS. Each height is listed once
+  per packaging, preferring h264, then h265, av1 and vp9.
+- HLS is downloaded by snag as parallel segments and joined without ffmpeg. Transport
+  stream playlists are saved as `.ts`, fragmented mp4 playlists as a fragmented `.mp4`.
+  Encrypted (AES) playlists are not supported and say so.
+- Requests carry an age-verified cookie and an xHamster referer; mpv and vlc get the same
+  referer. Links locked to one IP are ranked below open ones.
+- Geo-blocked and removed videos are reported as such. Video-only audio extraction does
+  not exist here: every xHamster stream is a single muxed file.
+
 ## Layout
 
 ```
 src/
   main.rs        flags and non-interactive mode
-  search.rs      search and paging
+  site.rs        picks YouTube or xHamster for search, resolve, profiles, suggestions
+  search.rs      YouTube search and paging
+  xh/            xHamster: cipher, initials, page scraper, sources, profiles, suggestions
+  hls.rs         playlist parsing
+  hlsdl.rs       parallel segment download and join
   innertube.rs   stream lookup
   ytultra.rs     second stream source
   source.rs      merged stream list and ranking

@@ -2,8 +2,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 
 pub fn serve(files: Vec<(String, Vec<u8>)>) -> String {
+    serve_with(|_| files)
+}
+
+pub fn serve_with(build: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let files = build(&base);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else {

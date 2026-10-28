@@ -6,10 +6,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::hlsdl;
 use crate::mux;
 use crate::util::{human_size, sanitize_filename};
 
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
+pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
 const CHUNK: u64 = 4 * 1024 * 1024;
 const WORKERS: usize = 6;
 
@@ -17,6 +18,7 @@ const WORKERS: usize = 6;
 pub struct Remote {
     pub url: String,
     pub ext: String,
+    pub referer: Option<String>,
 }
 
 pub enum Job {
@@ -129,7 +131,7 @@ fn execute(
             let part = dir.join(format!(".snag-{id}-{pid}.audio"));
             let _temps = Temps(vec![part.clone()]);
             let _ = tx.send(Msg::Stage(Stage::Fetching));
-            if !fetch(&audio.url, &part, tx, cancel)? {
+            if !fetch(audio, &part, tx, cancel)? {
                 return Ok(None);
             }
             save(&part, &dest)?;
@@ -151,7 +153,18 @@ fn execute(
                 merged_part.clone(),
             ]);
             let _ = tx.send(Msg::Stage(Stage::Fetching));
-            if !fetch(&video.url, &video_part, tx, cancel)? {
+            if video.ext == "m3u8" {
+                let scratch = dir.join(format!(".snag-{id}-{pid}.segments"));
+                let _scratch = Temps(vec![scratch.clone()]);
+                let Some(container) = hlsdl::fetch(video, &video_part, &scratch, tx, cancel)?
+                else {
+                    return Ok(None);
+                };
+                let dest = unique_path(dir, &stem, container, id);
+                save(&video_part, &dest)?;
+                return Ok(Some(dest));
+            }
+            if !fetch(video, &video_part, tx, cancel)? {
                 return Ok(None);
             }
             let pair = audio
@@ -168,7 +181,7 @@ fn execute(
                 return Ok(Some(dest));
             };
             let _ = tx.send(Msg::Stage(Stage::FetchingAudio));
-            if !fetch(&remote.url, &audio_part, tx, cancel)? {
+            if !fetch(remote, &audio_part, tx, cancel)? {
                 return Ok(None);
             }
             let _ = tx.send(Msg::Stage(Stage::Merging));
@@ -184,20 +197,40 @@ fn execute(
     }
 }
 
+fn with_referer<B>(
+    request: ureq::RequestBuilder<B>,
+    referer: Option<&str>,
+) -> ureq::RequestBuilder<B> {
+    match referer {
+        Some(referer) => request.header("referer", referer),
+        None => request,
+    }
+}
+
 fn save(part: &Path, dest: &Path) -> Result<(), String> {
     fs::rename(part, dest).map_err(|error| format!("cannot save {}: {error}", dest.display()))
 }
 
-fn fetch(url: &str, dest: &Path, tx: &Sender<Msg>, cancel: &AtomicBool) -> Result<bool, String> {
+fn fetch(
+    remote: &Remote,
+    dest: &Path,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+) -> Result<bool, String> {
     if cancel.load(Ordering::Relaxed) {
         return Ok(false);
     }
-    let mut response = ureq::get(url)
-        .header("user-agent", USER_AGENT)
-        .header("accept", "*/*")
-        .header("range", "bytes=0-")
-        .call()
-        .map_err(|error| format!("download failed: {error}"))?;
+    let url = remote.url.as_str();
+    let referer = remote.referer.as_deref();
+    let mut response = with_referer(
+        ureq::get(url)
+            .header("user-agent", USER_AGENT)
+            .header("accept", "*/*")
+            .header("range", "bytes=0-"),
+        referer,
+    )
+    .call()
+    .map_err(|error| format!("download failed: {error}"))?;
     let ranged = response.status().as_u16() == 206;
     let total = response
         .headers()
@@ -210,7 +243,7 @@ fn fetch(url: &str, dest: &Path, tx: &Sender<Msg>, cancel: &AtomicBool) -> Resul
     let _ = tx.send(Msg::Total(total));
     if ranged && total > CHUNK {
         drop(response);
-        return fetch_segments(url, dest, total, tx, cancel);
+        return fetch_segments(url, referer, dest, total, tx, cancel);
     }
     let mut reader = response.body_mut().as_reader();
     let file = File::create(dest).map_err(|error| format!("cannot write download: {error}"))?;
@@ -244,6 +277,7 @@ fn fetch(url: &str, dest: &Path, tx: &Sender<Msg>, cancel: &AtomicBool) -> Resul
 
 fn fetch_segments(
     url: &str,
+    referer: Option<&str>,
     dest: &Path,
     total: u64,
     tx: &Sender<Msg>,
@@ -275,7 +309,7 @@ fn fetch_segments(
                 }
                 let start = index as u64 * CHUNK;
                 let end = (start + CHUNK).min(total) - 1;
-                if let Err(error) = fetch_segment(url, dest, start, end, &tx, done) {
+                if let Err(error) = fetch_segment(url, referer, dest, start, end, &tx, done) {
                     if failure.lock().map(|mut slot| slot.replace(error)).is_ok() {
                         stopped.store(true, Ordering::Relaxed);
                     }
@@ -299,18 +333,22 @@ fn fetch_segments(
 
 fn fetch_segment(
     url: &str,
+    referer: Option<&str>,
     dest: &Path,
     start: u64,
     end: u64,
     tx: &Sender<Msg>,
     done: &AtomicU64,
 ) -> Result<(), String> {
-    let mut response = ureq::get(url)
-        .header("user-agent", USER_AGENT)
-        .header("accept", "*/*")
-        .header("range", format!("bytes={start}-{end}"))
-        .call()
-        .map_err(|error| format!("download failed: {error}"))?;
+    let mut response = with_referer(
+        ureq::get(url)
+            .header("user-agent", USER_AGENT)
+            .header("accept", "*/*")
+            .header("range", format!("bytes={start}-{end}")),
+        referer,
+    )
+    .call()
+    .map_err(|error| format!("download failed: {error}"))?;
     if response.status().as_u16() != 206 {
         return Err("the server stopped honouring range requests".to_string());
     }
@@ -375,6 +413,7 @@ impl Drop for Temps {
     fn drop(&mut self) {
         for path in &self.0 {
             let _ = fs::remove_file(path);
+            let _ = fs::remove_dir_all(path);
         }
     }
 }
@@ -456,10 +495,12 @@ mod tests {
             video: Remote {
                 url: format!("{base}/v.mp4"),
                 ext: "mp4".to_string(),
+                referer: None,
             },
             audio: Some(Remote {
                 url: format!("{base}/a.m4a"),
                 ext: "m4a".to_string(),
+                referer: None,
             }),
             title: "My: clip".to_string(),
             id: "abcdefghijk".to_string(),
@@ -496,10 +537,12 @@ mod tests {
             video: Remote {
                 url: format!("{base}/v.mp4"),
                 ext: "mp4".to_string(),
+                referer: None,
             },
             audio: Some(Remote {
                 url: format!("{base}/a.m4a"),
                 ext: "weba".to_string(),
+                referer: None,
             }),
             title: "solo".to_string(),
             id: "abcdefghijk".to_string(),
@@ -529,10 +572,12 @@ mod tests {
             video: Remote {
                 url: format!("{base}/v.mp4"),
                 ext: "mp4".to_string(),
+                referer: None,
             },
             audio: Some(Remote {
                 url: format!("{base}/a.m4a"),
                 ext: "m4a".to_string(),
+                referer: None,
             }),
             title: "bad".to_string(),
             id: "abcdefghijk".to_string(),
@@ -557,9 +602,127 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let cancel = AtomicBool::new(true);
         let dest = dir.join("part");
-        let outcome = fetch("https://example.invalid/x", &dest, &tx, &cancel).unwrap();
+        let outcome = fetch(
+            &Remote {
+                url: "https://example.invalid/x".to_string(),
+                ext: "mp4".to_string(),
+                referer: None,
+            },
+            &dest,
+            &tx,
+            &cancel,
+        )
+        .unwrap();
         assert!(!outcome);
         assert!(!dest.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn hls_job(url: String) -> Job {
+        Job::Video {
+            video: Remote {
+                url,
+                ext: "m3u8".to_string(),
+                referer: Some("https://example.test/".to_string()),
+            },
+            audio: None,
+            title: "Stream: clip".to_string(),
+            id: "abc".to_string(),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("snag-hls-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn hls_transport_streams_are_joined_in_order_and_saved_as_ts() {
+        let segment = |tag: u8| {
+            let mut bytes = vec![0x47u8];
+            bytes.extend(std::iter::repeat_n(tag, 3000 + tag as usize));
+            bytes
+        };
+        let segments: Vec<Vec<u8>> = (0..9).map(segment).collect();
+        let mut playlist = String::from("#EXTM3U\n");
+        for index in 0..9 {
+            playlist.push_str(&format!("#EXTINF:2.0,\nseg{index}.ts\n"));
+        }
+        let mut files = vec![
+            (
+                "/h/master.m3u8".to_string(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=640x360\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2,RESOLUTION=1280x720\nhigh.m3u8\n".to_vec(),
+            ),
+            ("/h/high.m3u8".to_string(), playlist.into_bytes()),
+            ("/h/low.m3u8".to_string(), b"#EXTM3U\n#EXTINF:2,\nnope.ts\n".to_vec()),
+        ];
+        for (index, bytes) in segments.iter().enumerate() {
+            files.push((format!("/h/seg{index}.ts"), bytes.clone()));
+        }
+        let base = crate::testserver::serve(files);
+        let dir = scratch("ts");
+        let saved = run_blocking(hls_job(format!("{base}/h/master.m3u8")), dir.clone()).unwrap();
+        assert_eq!(saved.file_name().unwrap(), "Stream clip.ts");
+        assert_eq!(fs::read(&saved).unwrap(), segments.concat());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hls_fragmented_mp4_keeps_the_init_segment_first_and_saves_as_mp4() {
+        let init = [&[0u8, 0, 0, 16][..], b"ftypisom", &[0u8; 8][..]].concat();
+        let pieces: Vec<Vec<u8>> = (0..4u8)
+            .map(|tag| [&[0u8, 0, 0, 12][..], b"moof", &[tag; 4000][..]].concat())
+            .collect();
+        let mut playlist = String::from("#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n");
+        for index in 0..4 {
+            playlist.push_str(&format!("#EXTINF:4,\nf{index}.m4s\n"));
+        }
+        let mut files = vec![
+            ("/m/v.m3u8".to_string(), playlist.into_bytes()),
+            ("/m/init.mp4".to_string(), init.clone()),
+        ];
+        for (index, bytes) in pieces.iter().enumerate() {
+            files.push((format!("/m/f{index}.m4s"), bytes.clone()));
+        }
+        let base = crate::testserver::serve(files);
+        let dir = scratch("mp4");
+        let saved = run_blocking(hls_job(format!("{base}/m/v.m3u8")), dir.clone()).unwrap();
+        assert_eq!(saved.extension().unwrap(), "mp4");
+        assert_eq!(fs::read(&saved).unwrap(), [init, pieces.concat()].concat());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hls_failures_are_reported_and_leave_nothing_behind() {
+        let base = crate::testserver::serve(vec![
+            (
+                "/e/enc.m3u8".to_string(),
+                b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:2,\na.ts\n".to_vec(),
+            ),
+            ("/e/empty.m3u8".to_string(), b"#EXTM3U\n".to_vec()),
+            (
+                "/e/gone.m3u8".to_string(),
+                b"#EXTM3U\n#EXTINF:2,\nmissing.ts\n".to_vec(),
+            ),
+        ]);
+        let dir = scratch("fail");
+        let encrypted = run_blocking(hls_job(format!("{base}/e/enc.m3u8")), dir.clone());
+        assert!(encrypted.unwrap_err().contains("encrypted"));
+        let empty = run_blocking(hls_job(format!("{base}/e/empty.m3u8")), dir.clone());
+        assert!(empty.unwrap_err().contains("no segments"));
+        let gone = run_blocking(hls_job(format!("{base}/e/gone.m3u8")), dir.clone());
+        assert!(gone.unwrap_err().contains("download failed"));
+        let left = fs::read_dir(&dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(left, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

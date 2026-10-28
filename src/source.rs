@@ -1,4 +1,7 @@
+use crate::download::Remote;
 use crate::innertube;
+use crate::search::Video;
+use crate::xh;
 use crate::ytultra;
 
 pub const INNERTUBE: &str = "innertube";
@@ -26,18 +29,31 @@ impl Stream {
     pub fn is_audio(&self) -> bool {
         self.kind == Kind::Audio
     }
+
+    pub fn remote(&self) -> Remote {
+        Remote {
+            url: self.url.clone(),
+            ext: self.ext.clone(),
+            referer: matches!(self.provider, xh::INITIALS | xh::PAGE)
+                .then(|| xh::REFERER.to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
     pub title: Option<String>,
     pub streams: Vec<Stream>,
+    pub detail: Option<Video>,
 }
 
 impl Sources {
     pub fn merge(&mut self, other: Sources) {
         if self.title.is_none() {
             self.title = other.title;
+        }
+        if self.detail.is_none() {
+            self.detail = other.detail;
         }
         for stream in other.streams {
             if stream.url.is_empty() {
@@ -55,7 +71,7 @@ impl Sources {
         self.sort();
     }
 
-    fn sort(&mut self) {
+    pub fn sort(&mut self) {
         self.streams.sort_by(|left, right| {
             (!left.is_audio())
                 .cmp(&(!right.is_audio()))
@@ -158,6 +174,7 @@ fn from_ytultra(resolved: ytultra::Resolved) -> Sources {
     Sources {
         title: resolved.title,
         streams,
+        detail: None,
     }
 }
 
@@ -192,6 +209,7 @@ mod tests {
                 stream(YTULTRA, Kind::Audio, "128k", "m4a", 5_000_000),
                 stream(YTULTRA, Kind::Audio, "128k", "weba", 5_500_000),
             ],
+            ..Sources::default()
         });
         sources
     }
@@ -232,6 +250,7 @@ mod tests {
                 stream(INNERTUBE, Kind::Muxed, "360p", "mp4", 4_000_000),
                 stream(INNERTUBE, Kind::Audio, "128k", "m4a", 1_000_000),
             ],
+            ..Sources::default()
         });
         let muxed = sources.best_video(None).unwrap();
         assert!(sources.audio_for(muxed).is_none());
@@ -282,6 +301,7 @@ mod tests {
                 stream(INNERTUBE, Kind::Muxed, "720p", "mp4", 9_000_000),
                 stream(INNERTUBE, Kind::Audio, "128k", "m4a", 1_000_000),
             ],
+            ..Sources::default()
         });
         assert_eq!(sources.streams.len(), 6);
         assert_eq!(sources.providers(), vec![INNERTUBE, YTULTRA]);
@@ -294,10 +314,12 @@ mod tests {
         let mut sources = Sources {
             title: None,
             streams: vec![stream(YTULTRA, Kind::Video, "720p", "mp4", 8_000_000)],
+            ..Sources::default()
         };
         sources.merge(Sources {
             title: None,
             streams: vec![stream(INNERTUBE, Kind::Video, "720p", "mp4", 5_000_000)],
+            ..Sources::default()
         });
         assert_eq!(sources.providers(), vec![INNERTUBE, YTULTRA]);
         let best = sources.best_video(None).unwrap();

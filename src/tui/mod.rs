@@ -25,7 +25,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::play::{self, Player};
-use crate::search;
+use crate::site::Site;
 use app::{App, Flow, Mode};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -153,21 +153,16 @@ pub fn run(
     out_dir: PathBuf,
     player: Option<Player>,
     theme: Option<theme::ThemeMode>,
+    site: Option<Site>,
 ) -> Result<(), String> {
     install_panic_hook();
     let terminal = setup()?;
     let mut app = App::new(query, out_dir, player)
         .with_store(store::Store::locate())
-        .with_theme(theme);
+        .with_theme(theme)
+        .with_site(site);
     app.watch_clipboard();
-    let query = app.query.trim().to_string();
-    if !query.is_empty() {
-        if let Some(id) = search::video_id(&query) {
-            app.start_resolve(search::Video::stub(&id), Mode::Query);
-        } else {
-            app.start_search(query);
-        }
-    }
+    app.submit();
     let outcome = event_loop(terminal, app);
     let _ = teardown();
     outcome

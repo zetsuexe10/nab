@@ -184,3 +184,67 @@ fn pairs_matching_containers_only() {
     assert_eq!(Container::for_video("webm"), Container::WebM);
     assert_eq!(Container::for_video("mp4").extension(), "mp4");
 }
+
+fn survives(dir: &Path, video: &[u8], audio: &[u8], v_ext: &str, a_ext: &str) {
+    let v = dir.join(format!("v.{v_ext}"));
+    let a = dir.join(format!("a.{a_ext}"));
+    let out = dir.join("out.bin");
+    fs::write(&v, video).unwrap();
+    fs::write(&a, audio).unwrap();
+    let _ = merge(&v, &a, &out);
+}
+
+#[test]
+fn damaged_inputs_fail_cleanly_instead_of_panicking() {
+    let dir = scratch("damaged");
+    let video = synth::frames(true, 6, 1);
+    let audio = synth::frames(false, 9, 2);
+    let sets: [(Vec<u8>, Vec<u8>, &str, &str); 3] = [
+        (
+            synth::progressive(true, &video, 15360, 512),
+            synth::progressive(false, &audio, 44100, 1024),
+            "mp4",
+            "m4a",
+        ),
+        (
+            synth::fragmented(true, &video, 15360, 512),
+            synth::fragmented(false, &audio, 44100, 1024),
+            "mp4",
+            "m4a",
+        ),
+        (
+            synth::webm(
+                true,
+                &synth::frames(true, 6, 1)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, frame)| (index as i64 * 40, frame))
+                    .collect::<Vec<_>>(),
+            ),
+            synth::webm(
+                false,
+                &synth::frames(false, 9, 2)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, frame)| (index as i64 * 23, frame))
+                    .collect::<Vec<_>>(),
+            ),
+            "webm",
+            "weba",
+        ),
+    ];
+    for (v, a, v_ext, a_ext) in &sets {
+        for cut in (0..v.len()).step_by(3) {
+            survives(&dir, &v[..cut], a, v_ext, a_ext);
+        }
+        for at in (0..v.len()).step_by(5) {
+            let mut bent = v.clone();
+            bent[at] = bent[at].wrapping_add(0x55);
+            survives(&dir, &bent, a, v_ext, a_ext);
+            let mut bent = a.clone();
+            let at = at % a.len();
+            bent[at] ^= 0xff;
+            survives(&dir, v, &bent, v_ext, a_ext);
+        }
+    }
+}

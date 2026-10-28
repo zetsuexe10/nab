@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use super::app::{App, Mode};
 use crate::play::Player;
 use crate::search::Video;
+use crate::site::Suggestion;
 use crate::source::{Kind, Sources, Stream, INNERTUBE, YTULTRA};
 
 pub fn video(index: usize) -> Video {
@@ -51,9 +52,41 @@ pub fn app() -> App {
             stream(INNERTUBE, Kind::Muxed, "360p", "mp4", 9_000_000),
             stream(YTULTRA, Kind::Video, "1080p", "webm", 40_000_000),
         ],
+        ..Sources::default()
     });
     app.current = Some(video(0));
     app.provider = Some(INNERTUBE);
     app.sources = Some(sources);
+    app
+}
+
+pub fn profiled() -> App {
+    let mut app = app();
+    app.profile = Some(crate::xh::sample_profile());
+    app.mode = Mode::Profile;
+    app
+}
+
+pub fn suggested() -> App {
+    let mut app = app();
+    app.mode = Mode::Query;
+    app.query = "sam".to_string();
+    app.caret = 3;
+    app.suggestions = vec![
+        Suggestion {
+            text: "sam smith".to_string(),
+            query: "sam smith".to_string(),
+            profile: None,
+            tag: "",
+            count: None,
+        },
+        Suggestion {
+            text: "Sample Creator".to_string(),
+            query: "Sample Creator".to_string(),
+            profile: Some("https://xhamster.com/creators/sample".to_string()),
+            tag: "creator",
+            count: Some(88),
+        },
+    ];
     app
 }

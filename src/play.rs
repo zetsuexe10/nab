@@ -109,6 +109,7 @@ fn os(text: impl Into<OsString>) -> OsString {
 fn mpv_args(
     video: Option<&str>,
     audio: Option<&str>,
+    referer: Option<&str>,
     title: &str,
 ) -> Result<Vec<OsString>, String> {
     let mut args = vec![
@@ -116,6 +117,9 @@ fn mpv_args(
         os(format!("--user-agent={USER_AGENT}")),
         os("--ytdl=no"),
     ];
+    if let Some(referer) = referer {
+        args.push(os(format!("--referrer={referer}")));
+    }
     match (video, audio) {
         (Some(video), Some(audio)) => {
             args.push(os(format!("--audio-file={audio}")));
@@ -140,6 +144,7 @@ fn mpv_args(
 fn vlc_args(
     video: Option<&str>,
     audio: Option<&str>,
+    referer: Option<&str>,
     title: &str,
 ) -> Result<Vec<OsString>, String> {
     let mut args = vec![os("--play-and-exit")];
@@ -154,6 +159,9 @@ fn vlc_args(
     args.push(os(target));
     args.push(os(format!(":meta-title={title}")));
     args.push(os(format!(":http-user-agent={USER_AGENT}")));
+    if let Some(referer) = referer {
+        args.push(os(format!(":http-referrer={referer}")));
+    }
     if let (Some(_), Some(audio)) = (video, audio) {
         args.push(os(format!(":input-slave={audio}")));
     }
@@ -225,9 +233,10 @@ fn play_streams(
     }
     let video_url = video.map(|remote| remote.url.as_str());
     let audio_url = audio.map(|remote| remote.url.as_str());
+    let referer = video.or(audio).and_then(|remote| remote.referer.as_deref());
     let args = match player {
-        Player::Mpv => mpv_args(video_url, audio_url, title)?,
-        Player::Vlc => vlc_args(video_url, audio_url, title)?,
+        Player::Mpv => mpv_args(video_url, audio_url, referer, title)?,
+        Player::Vlc => vlc_args(video_url, audio_url, referer, title)?,
     };
     launch(program, &args, player)
 }
@@ -290,7 +299,7 @@ mod tests {
 
     #[test]
     fn mpv_streams_both_urls_without_ytdl() {
-        let args = text(&mpv_args(Some("https://v"), Some("https://a"), "Clip").unwrap());
+        let args = text(&mpv_args(Some("https://v"), Some("https://a"), None, "Clip").unwrap());
         assert!(args.contains(&"--force-media-title=Clip".to_string()));
         assert!(args.contains(&"--ytdl=no".to_string()));
         assert!(args.contains(&"--audio-file=https://a".to_string()));
@@ -301,21 +310,21 @@ mod tests {
 
     #[test]
     fn mpv_audio_only_hides_the_window() {
-        let args = text(&mpv_args(None, Some("https://a"), "Clip").unwrap());
+        let args = text(&mpv_args(None, Some("https://a"), None, "Clip").unwrap());
         assert!(args.contains(&"--no-video".to_string()));
         assert!(args.contains(&"--force-window=no".to_string()));
-        assert!(mpv_args(None, None, "Clip").is_err());
+        assert!(mpv_args(None, None, None, "Clip").is_err());
     }
 
     #[test]
     fn vlc_gets_item_options_after_the_target() {
-        let args = text(&vlc_args(Some("https://v"), Some("https://a"), "Clip").unwrap());
+        let args = text(&vlc_args(Some("https://v"), Some("https://a"), None, "Clip").unwrap());
         assert_eq!(args[0], "--play-and-exit");
         assert_eq!(args[1], "https://v");
         assert!(args.contains(&":meta-title=Clip".to_string()));
         assert!(args.contains(&":input-slave=https://a".to_string()));
         assert!(args.iter().any(|arg| arg.starts_with(":http-user-agent=")));
-        let audio = text(&vlc_args(None, Some("https://a"), "Clip").unwrap());
+        let audio = text(&vlc_args(None, Some("https://a"), None, "Clip").unwrap());
         assert!(audio.contains(&"--no-video".to_string()));
         assert!(!audio.iter().any(|arg| arg.starts_with(":input-slave")));
     }
@@ -361,10 +370,12 @@ mod tests {
         let video = Remote {
             url: "https://v.example/video".to_string(),
             ext: "mp4".to_string(),
+            referer: None,
         };
         let audio = Remote {
             url: "https://a.example/audio".to_string(),
             ext: "m4a".to_string(),
+            referer: None,
         };
         play_streams(&script, Some(&video), Some(&audio), "Clip", Player::Mpv).unwrap();
         let seen = fs::read_to_string(&log).unwrap();
@@ -395,10 +406,12 @@ mod tests {
         let video = Remote {
             url: format!("{base}/v.mp4"),
             ext: "mp4".to_string(),
+            referer: None,
         };
         let audio = Remote {
             url: format!("{base}/a.m4a"),
             ext: "m4a".to_string(),
+            referer: None,
         };
         play_streams(&script, Some(&video), Some(&audio), "Clip", Player::Vlc).unwrap();
         let seen = fs::read_to_string(&log).unwrap();

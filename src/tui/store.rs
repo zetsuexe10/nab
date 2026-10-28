@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::theme::ThemeMode;
+use crate::site::Site;
 
 const LIMIT: usize = 50;
 
@@ -69,6 +70,16 @@ impl Store {
         self.write("theme", mode.label());
     }
 
+    pub fn site(&self) -> Option<Site> {
+        fs::read_to_string(self.dir.join("site"))
+            .ok()
+            .and_then(|text| Site::parse(&text))
+    }
+
+    pub fn save_site(&self, site: Site) {
+        self.write("site", site.label());
+    }
+
     fn write(&self, name: &str, text: &str) {
         if fs::create_dir_all(&self.dir).is_ok() {
             let _ = fs::write(self.dir.join(name), text);
@@ -123,6 +134,9 @@ mod tests {
         assert_eq!(store.theme(), Some(ThemeMode::Dark));
         fs::write(dir.join("theme"), "purple").unwrap();
         assert_eq!(store.theme(), None);
+        assert_eq!(store.site(), None);
+        store.save_site(Site::XHamster);
+        assert_eq!(store.site(), Some(Site::XHamster));
         fs::write(dir.join("history.json"), "{broken").unwrap();
         assert!(store.history().is_empty());
         let _ = fs::remove_dir_all(dir);

@@ -141,6 +141,7 @@ fn parse(json: &Value) -> Result<Sources, String> {
     let mut built = Sources {
         title,
         streams: Vec::new(),
+        detail: None,
     };
     for (key, muxed) in [("formats", true), ("adaptiveFormats", false)] {
         let Some(items) = streaming.get(key).and_then(Value::as_array) else {

@@ -12,17 +12,22 @@ use super::store::Store;
 use super::theme::ThemeMode;
 use crate::download::{self, Job, Msg, Remote, Stage};
 use crate::play::{self, Player};
-use crate::search::{self, Cursor, Page, Video};
+use crate::search::Video;
+use crate::site::{self, Cursor, Entry, Page, Site, Suggestion};
 use crate::source::{self, Kind, Sources, Stream};
+use crate::xh;
 
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 const PAGE: isize = 8;
+const SUGGEST_AFTER: Duration = Duration::from_millis(180);
+pub const SUGGEST_MAX: usize = 6;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Query,
     Results,
     Formats,
+    Profile,
     Busy,
     Download,
     Done,
@@ -50,6 +55,7 @@ pub enum Hit {
     Key(KeyCode, KeyModifiers),
     Result(usize),
     Choice(usize),
+    Suggest(usize),
     Logo,
 }
 
@@ -63,12 +69,24 @@ enum Work {
     First(Result<Page, String>),
     More(Result<Page, String>),
     Resolved(Video, Result<Sources, String>),
+    Profiled(Result<xh::Profile, String>),
+    Suggested(Site, String, Vec<Suggestion>),
     Clipboard(Option<String>),
 }
 
 pub struct App {
+    pub site: Site,
     pub query: String,
     pub caret: usize,
+    pub suggestions: Vec<Suggestion>,
+    pub suggest_sel: Option<usize>,
+    suggest_for: String,
+    typed_at: Option<Instant>,
+    pub profile: Option<xh::Profile>,
+    pub psel: usize,
+    pub pscroll: usize,
+    profile_from: Mode,
+    formats_from: Mode,
     pub results: Vec<Video>,
     pub sel: usize,
     pub rscroll: usize,
@@ -124,8 +142,18 @@ impl App {
             .collect();
         let caret = query.chars().count();
         App {
+            site: Site::YouTube,
             query,
             caret,
+            suggestions: Vec::new(),
+            suggest_sel: None,
+            suggest_for: String::new(),
+            typed_at: None,
+            profile: None,
+            psel: 0,
+            pscroll: 0,
+            profile_from: Mode::Query,
+            formats_from: Mode::Results,
             results: Vec::new(),
             sel: 0,
             rscroll: 0,
@@ -179,6 +207,9 @@ impl App {
             if let Some(theme) = store.theme() {
                 self.theme = theme;
             }
+            if let Some(site) = store.site() {
+                self.site = site;
+            }
         }
         self.store = store;
         self
@@ -187,6 +218,13 @@ impl App {
     pub fn with_theme(mut self, theme: Option<ThemeMode>) -> Self {
         if let Some(theme) = theme {
             self.theme = theme;
+        }
+        self
+    }
+
+    pub fn with_site(mut self, site: Option<Site>) -> Self {
+        if let Some(site) = site {
+            self.site = site;
         }
         self
     }
@@ -245,6 +283,97 @@ impl App {
         self.poll_work();
         self.poll_download();
         self.maybe_load_more();
+        self.maybe_suggest();
+    }
+
+    fn edited(&mut self) {
+        self.suggest_sel = None;
+        self.recall = None;
+        let query = self.query.trim();
+        if query.is_empty()
+            || query.contains("://")
+            || !matches!(site::classify(query), Entry::Search(_))
+        {
+            self.suggestions.clear();
+            self.suggest_for.clear();
+            self.typed_at = None;
+            return;
+        }
+        if query != self.suggest_for {
+            self.typed_at = Some(Instant::now());
+        }
+    }
+
+    fn maybe_suggest(&mut self) {
+        let Some(at) = self.typed_at else {
+            return;
+        };
+        if self.mode != Mode::Query || at.elapsed() < SUGGEST_AFTER {
+            return;
+        }
+        self.typed_at = None;
+        let query = self.query.trim().to_string();
+        if query.is_empty() || query == self.suggest_for {
+            return;
+        }
+        self.suggest_for = query.clone();
+        let tx = self.work_tx.clone();
+        let site = self.site;
+        std::thread::spawn(move || {
+            let rows = site::suggest(site, &query);
+            let _ = tx.send((0, Work::Suggested(site, query, rows)));
+        });
+    }
+
+    pub fn dropdown(&self) -> bool {
+        self.mode == Mode::Query && !self.suggestions.is_empty() && !self.query.trim().is_empty()
+    }
+
+    fn switch_site(&mut self) {
+        self.site = self.site.next();
+        if let Some(store) = &self.store {
+            store.save_site(self.site);
+        }
+        self.results.clear();
+        self.cursor = None;
+        self.suggestions.clear();
+        self.suggest_for.clear();
+        self.suggest_sel = None;
+        self.typed_at = None;
+        self.edited();
+        self.tell(format!("searching {}", self.site.title()));
+    }
+
+    fn move_suggestion(&mut self, delta: isize) {
+        let last = self.suggestions.len() as isize - 1;
+        if last < 0 {
+            return;
+        }
+        self.suggest_sel = match (self.suggest_sel, delta) {
+            (None, 1) => Some(0),
+            (None, _) => Some(last as usize),
+            (Some(0), -1) => None,
+            (Some(at), step) => Some((at as isize + step).clamp(0, last) as usize),
+        };
+    }
+
+    fn take_suggestion(&mut self, index: usize) {
+        let Some(row) = self.suggestions.get(index).cloned() else {
+            return;
+        };
+        self.query = row.query.clone();
+        self.caret = self.len();
+        self.suggestions.clear();
+        self.suggest_sel = None;
+        self.suggest_for = row.query.clone();
+        self.typed_at = None;
+        match row.profile {
+            Some(url) => {
+                self.remember(&row.text);
+                self.open_profile(url, "featured", 1, Mode::Query);
+            }
+            None => self.submit(),
+        }
     }
 
     fn busy(&mut self, label: &str) {
@@ -279,10 +408,16 @@ impl App {
             return;
         }
         self.remember(&query);
-        if let Some(id) = search::video_id(&query) {
-            self.start_resolve(Video::stub(&id), Mode::Query);
-        } else {
-            self.start_search(query);
+        self.suggestions.clear();
+        self.suggest_sel = None;
+        self.typed_at = None;
+        if xh::classify(&query).is_some() {
+            self.site = Site::XHamster;
+        }
+        match site::classify(&query) {
+            Entry::Video(video) => self.start_resolve(video, Mode::Query),
+            Entry::Profile(url) => self.open_profile(url, "featured", 1, Mode::Query),
+            Entry::Search(text) => self.start_search(text),
         }
     }
 
@@ -297,33 +432,72 @@ impl App {
         self.loading_more = false;
         self.back = Mode::Query;
         self.busy("searching");
-        self.spawn(move || Work::First(search::search(&query)));
+        let site = self.site;
+        self.spawn(move || Work::First(site::search(site, &query)));
     }
 
     pub fn start_resolve(&mut self, video: Video, back: Mode) {
         self.ticket += 1;
         self.loading_more = false;
         self.back = back;
+        self.formats_from = back;
         self.busy("resolving streams");
-        let id = video.id.clone();
-        self.spawn(move || Work::Resolved(video, source::resolve(&id)));
+        self.spawn(move || {
+            let result = site::resolve(&video);
+            Work::Resolved(video, result)
+        });
+    }
+
+    pub fn open_profile(&mut self, url: String, sort: &str, page: u32, back: Mode) {
+        self.ticket += 1;
+        self.loading_more = false;
+        self.back = back;
+        if back != Mode::Profile {
+            self.profile_from = back;
+        }
+        self.busy("loading profile");
+        let sort = sort.to_string();
+        self.spawn(move || Work::Profiled(site::profile(&url, &sort, page)));
+    }
+
+    fn open_author(&mut self, video: Option<Video>, back: Mode) {
+        match video.and_then(|video| video.author_url) {
+            Some(url) => self.open_profile(url, "featured", 1, back),
+            None => self.tell("no profile for this video"),
+        }
     }
 
     fn poll_work(&mut self) {
         while let Ok((ticket, work)) = self.work_rx.try_recv() {
-            if let Work::Clipboard(found) = work {
-                self.clip = found;
-                continue;
-            }
-            if ticket != self.ticket {
-                continue;
-            }
             match work {
-                Work::First(result) => self.apply_search(result),
-                Work::More(result) => self.apply_more(result),
-                Work::Resolved(video, result) => self.apply_resolve(video, result),
-                Work::Clipboard(_) => {}
+                Work::Clipboard(found) => {
+                    self.clip = found;
+                    continue;
+                }
+                Work::Suggested(site, query, rows) => {
+                    if site == self.site && query == self.query.trim() && self.mode == Mode::Query {
+                        self.suggestions = rows.into_iter().take(SUGGEST_MAX).collect();
+                        self.suggest_sel = None;
+                    }
+                    continue;
+                }
+                other => {
+                    if ticket != self.ticket {
+                        continue;
+                    }
+                    self.apply(other);
+                }
             }
+        }
+    }
+
+    fn apply(&mut self, work: Work) {
+        match work {
+            Work::First(result) => self.apply_search(result),
+            Work::More(result) => self.apply_more(result),
+            Work::Resolved(video, result) => self.apply_resolve(video, result),
+            Work::Profiled(result) => self.apply_profile(result),
+            Work::Suggested(..) | Work::Clipboard(_) => {}
         }
     }
 
@@ -361,16 +535,32 @@ impl App {
             Ok(sources) if sources.streams.is_empty() => self.fail("no downloadable streams", back),
             Ok(sources) => {
                 let providers = sources.providers();
-                self.provider = providers
-                    .iter()
-                    .copied()
-                    .find(|name| *name == source::INNERTUBE)
+                self.provider = [source::INNERTUBE, xh::INITIALS]
+                    .into_iter()
+                    .find(|wanted| providers.contains(wanted))
                     .or(providers.first().copied());
+                let mut video = video;
+                if let Some(detail) = &sources.detail {
+                    enrich(&mut video, detail);
+                }
                 self.current = Some(video);
                 self.sources = Some(sources);
                 self.choice = 0;
                 self.cscroll = 0;
                 self.mode = Mode::Formats;
+            }
+            Err(error) => self.fail(error, back),
+        }
+    }
+
+    fn apply_profile(&mut self, result: Result<xh::Profile, String>) {
+        let back = self.back;
+        match result {
+            Ok(profile) => {
+                self.profile = Some(profile);
+                self.psel = 0;
+                self.pscroll = 0;
+                self.mode = Mode::Profile;
             }
             Err(error) => self.fail(error, back),
         }
@@ -387,7 +577,7 @@ impl App {
             return;
         }
         self.loading_more = true;
-        self.spawn(move || Work::More(search::more(&cursor)));
+        self.spawn(move || Work::More(site::more(&cursor)));
     }
 
     pub fn providers(&self) -> Vec<&'static str> {
@@ -488,12 +678,15 @@ impl App {
             Mode::Query => self.key_query(key),
             Mode::Results => self.key_results(key),
             Mode::Formats => self.key_formats(key),
+            Mode::Profile => self.key_profile(key),
             Mode::Busy => {
                 if key.code == KeyCode::Esc {
                     self.ticket += 1;
                     self.loading_more = false;
                     self.mode = if self.back == Mode::Formats && self.sources.is_some() {
                         Mode::Formats
+                    } else if self.back == Mode::Profile && self.profile.is_some() {
+                        Mode::Profile
                     } else if self.back == Mode::Results && !self.results.is_empty() {
                         Mode::Results
                     } else {
@@ -517,6 +710,7 @@ impl App {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.mode = match self.back {
                         Mode::Results if self.results.is_empty() => Mode::Query,
+                        Mode::Profile if self.profile.is_none() => Mode::Query,
                         Mode::Formats if self.sources.is_none() => Mode::Results,
                         other => other,
                     };
@@ -546,6 +740,8 @@ impl App {
         self.clip_taken = true;
         if clip::link(&self.query).is_some() {
             self.submit();
+        } else {
+            self.edited();
         }
         Flow::Continue
     }
@@ -573,6 +769,13 @@ impl App {
                         self.sel = index.min(self.results.len().saturating_sub(1));
                         return self.on_key(plain(KeyCode::Enter));
                     }
+                    Some(Hit::Result(index)) if self.mode == Mode::Profile => {
+                        self.psel = index.min(self.profile_videos().saturating_sub(1));
+                        return self.on_key(plain(KeyCode::Enter));
+                    }
+                    Some(Hit::Suggest(index)) if self.mode == Mode::Query => {
+                        self.take_suggestion(index);
+                    }
                     Some(Hit::Choice(index)) if self.mode == Mode::Formats => {
                         self.choice = index.min(self.visible().len().saturating_sub(1));
                         return self.on_key(plain(KeyCode::Enter));
@@ -590,6 +793,8 @@ impl App {
         match self.mode {
             Mode::Results => self.move_result(delta),
             Mode::Formats => self.move_choice(delta),
+            Mode::Profile => self.move_profile(delta),
+            Mode::Query if self.dropdown() => self.move_suggestion(delta),
             _ => {}
         }
     }
@@ -597,25 +802,53 @@ impl App {
     fn key_query(&mut self, key: KeyEvent) -> Flow {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Enter => self.submit(),
+            KeyCode::Enter => match self.suggest_sel {
+                Some(index) if self.dropdown() => self.take_suggestion(index),
+                _ => self.submit(),
+            },
             KeyCode::Esc => {
-                if self.results.is_empty() {
+                if self.dropdown() {
+                    self.suggestions.clear();
+                    self.suggest_sel = None;
+                } else if self.results.is_empty() {
                     return Flow::Quit;
+                } else {
+                    self.mode = Mode::Results;
                 }
-                self.mode = Mode::Results;
             }
             KeyCode::Tab => {
-                if let Some(link) = self.offered().map(str::to_string) {
+                if let Some(row) = self
+                    .suggest_sel
+                    .filter(|_| self.dropdown())
+                    .and_then(|index| self.suggestions.get(index))
+                    .map(|row| row.query.clone())
+                {
+                    self.query = row;
+                    self.caret = self.len();
+                    self.suggest_for.clear();
+                    self.edited();
+                } else if let Some(link) = self.offered().map(str::to_string) {
                     self.query = link;
                     self.caret = self.len();
                     self.clip_taken = true;
+                    self.edited();
+                } else if self.dropdown() {
+                    self.move_suggestion(1);
                 } else if !self.results.is_empty() {
                     self.mode = Mode::Results;
                 }
             }
-            KeyCode::Up => self.recall_older(),
+            KeyCode::Up => {
+                if self.suggest_sel.is_some() {
+                    self.move_suggestion(-1);
+                } else {
+                    self.recall_older();
+                }
+            }
             KeyCode::Down => {
-                if self.recall.is_some() {
+                if self.dropdown() && self.recall.is_none() {
+                    self.move_suggestion(1);
+                } else if self.recall.is_some() {
                     self.recall_newer();
                 } else if !self.results.is_empty() {
                     self.mode = Mode::Results;
@@ -629,16 +862,25 @@ impl App {
                 if self.caret > 0 {
                     self.remove(self.caret - 1, self.caret);
                     self.caret -= 1;
+                    self.edited();
                 }
             }
-            KeyCode::Delete => self.remove(self.caret, self.caret + 1),
+            KeyCode::Delete => {
+                self.remove(self.caret, self.caret + 1);
+                self.edited();
+            }
             KeyCode::Char('a') if control => self.caret = 0,
             KeyCode::Char('e') if control => self.caret = self.len(),
+            KeyCode::Char('s') if control => self.switch_site(),
             KeyCode::Char('u') if control => {
                 self.remove(0, self.caret);
                 self.caret = 0;
+                self.edited();
             }
-            KeyCode::Char('k') if control => self.remove(self.caret, self.len()),
+            KeyCode::Char('k') if control => {
+                self.remove(self.caret, self.len());
+                self.edited();
+            }
             KeyCode::Char('w') if control => {
                 let chars: Vec<char> = self.query.chars().collect();
                 let mut start = self.caret;
@@ -650,12 +892,13 @@ impl App {
                 }
                 self.remove(start, self.caret);
                 self.caret = start;
+                self.edited();
             }
             KeyCode::Char(character) if !control => {
                 let at = self.byte_at(self.caret);
                 self.query.insert(at, character);
                 self.caret += 1;
-                self.recall = None;
+                self.edited();
             }
             _ => {}
         }
@@ -676,6 +919,7 @@ impl App {
         self.recall = Some(next);
         self.query = self.history[next].clone();
         self.caret = self.len();
+        self.suggestions.clear();
     }
 
     fn recall_newer(&mut self) {
@@ -729,6 +973,10 @@ impl App {
                 self.caret = self.len();
                 self.mode = Mode::Query;
             }
+            KeyCode::Char('o') => {
+                let video = self.results.get(self.sel).cloned();
+                self.open_author(video, Mode::Results);
+            }
             KeyCode::Char('q') => return Flow::Quit,
             _ => {}
         }
@@ -768,17 +1016,142 @@ impl App {
             KeyCode::Char('m') => return self.run_stream(false, Some(Player::Mpv)),
             KeyCode::Char('v') => return self.run_stream(false, Some(Player::Vlc)),
             KeyCode::Tab => self.cycle_provider(),
+            KeyCode::Char('o') => {
+                let video = self.current.clone();
+                self.open_author(video, Mode::Formats);
+            }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                self.mode = if self.results.is_empty() {
-                    Mode::Query
-                } else {
-                    Mode::Results
+                self.mode = match self.formats_from {
+                    Mode::Profile if self.profile.is_some() => Mode::Profile,
+                    _ if self.results.is_empty() => Mode::Query,
+                    _ => Mode::Results,
                 };
             }
             KeyCode::Char('/') => {
                 self.caret = self.len();
                 self.mode = Mode::Query;
             }
+            KeyCode::Char('q') => return Flow::Quit,
+            _ => {}
+        }
+        Flow::Continue
+    }
+
+    pub fn profile_videos(&self) -> usize {
+        self.profile
+            .as_ref()
+            .map(|profile| profile.videos.len())
+            .unwrap_or(0)
+    }
+
+    fn move_profile(&mut self, delta: isize) {
+        let count = self.profile_videos();
+        if count == 0 {
+            return;
+        }
+        self.psel = (self.psel as isize + delta).clamp(0, count as isize - 1) as usize;
+    }
+
+    fn sort_ids(&self) -> Vec<String> {
+        let Some(profile) = &self.profile else {
+            return Vec::new();
+        };
+        if profile.sorts.is_empty() {
+            xh::SORT_SEGMENTS
+                .iter()
+                .map(|(id, _)| (*id).to_string())
+                .collect()
+        } else {
+            profile.sorts.iter().map(|sort| sort.id.clone()).collect()
+        }
+    }
+
+    pub fn sort_label(&self) -> String {
+        let Some(profile) = &self.profile else {
+            return String::new();
+        };
+        profile
+            .sorts
+            .iter()
+            .find(|sort| sort.id == profile.sort)
+            .map(|sort| sort.label.clone())
+            .unwrap_or_else(|| profile.sort.clone())
+    }
+
+    fn turn_page(&mut self, forward: bool) {
+        let Some(profile) = &self.profile else {
+            return;
+        };
+        let (page, last) = (profile.paging.page, profile.paging.last);
+        let (url, sort) = (profile.url.clone(), profile.sort.clone());
+        if forward {
+            if last != 0 && page >= last || profile.videos.is_empty() {
+                self.tell("last page");
+                return;
+            }
+            self.open_profile(url, &sort, page + 1, Mode::Profile);
+        } else {
+            if page <= 1 {
+                self.tell("first page");
+                return;
+            }
+            self.open_profile(url, &sort, page - 1, Mode::Profile);
+        }
+    }
+
+    fn cycle_sort(&mut self) {
+        let ids = self.sort_ids();
+        let Some(profile) = &self.profile else {
+            return;
+        };
+        if ids.len() < 2 {
+            return;
+        }
+        let at = ids.iter().position(|id| *id == profile.sort).unwrap_or(0);
+        let next = ids[(at + 1) % ids.len()].clone();
+        let url = profile.url.clone();
+        self.open_profile(url, &next, 1, Mode::Profile);
+    }
+
+    fn leave_profile(&mut self) {
+        self.mode = match self.profile_from {
+            Mode::Results if !self.results.is_empty() => Mode::Results,
+            Mode::Formats if self.sources.is_some() => Mode::Formats,
+            _ => {
+                self.caret = self.len();
+                Mode::Query
+            }
+        };
+    }
+
+    fn key_profile(&mut self, key: KeyEvent) -> Flow {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_profile(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_profile(1),
+            KeyCode::PageUp => self.move_profile(-PAGE),
+            KeyCode::PageDown => self.move_profile(PAGE),
+            KeyCode::Home | KeyCode::Char('g') => self.psel = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.psel = self.profile_videos().saturating_sub(1)
+            }
+            KeyCode::Enter => {
+                let video = self
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.videos.get(self.psel))
+                    .cloned();
+                if let Some(video) = video {
+                    self.start_resolve(video, Mode::Profile);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('n') | KeyCode::Char(']') => self.turn_page(true),
+            KeyCode::Left | KeyCode::Char('p') | KeyCode::Char('[') => self.turn_page(false),
+            KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('/') => {
+                self.caret = self.len();
+                self.mode = Mode::Query;
+            }
+            KeyCode::Esc | KeyCode::Char('h') => self.leave_profile(),
             KeyCode::Char('q') => return Flow::Quit,
             _ => {}
         }
@@ -814,13 +1187,6 @@ impl App {
         }
     }
 
-    fn remote(stream: &Stream) -> Remote {
-        Remote {
-            url: stream.url.clone(),
-            ext: stream.ext.clone(),
-        }
-    }
-
     fn run_stream(&mut self, save: bool, wanted: Option<Player>) -> Flow {
         let Some(sources) = self.sources.clone() else {
             return Flow::Continue;
@@ -838,16 +1204,16 @@ impl App {
             .as_ref()
             .map(|video| video.id.clone())
             .unwrap_or_default();
-        let pair = sources.audio_for(&stream).map(Self::remote);
+        let pair = sources.audio_for(&stream).map(Stream::remote);
         if save {
             let job = match stream.kind {
                 Kind::Audio => Job::Audio {
-                    audio: Self::remote(&stream),
+                    audio: stream.remote(),
                     title,
                     id,
                 },
                 Kind::Video | Kind::Muxed => Job::Video {
-                    video: Self::remote(&stream),
+                    video: stream.remote(),
                     audio: pair,
                     title,
                     id,
@@ -867,12 +1233,12 @@ impl App {
         match stream.kind {
             Kind::Audio => Flow::Play {
                 video: None,
-                audio: Some(Self::remote(&stream)),
+                audio: Some(stream.remote()),
                 title,
                 player,
             },
             Kind::Muxed | Kind::Video => Flow::Play {
-                video: Some(Self::remote(&stream)),
+                video: Some(stream.remote()),
                 audio: pair,
                 title,
                 player,
@@ -956,13 +1322,32 @@ impl App {
     }
 }
 
+fn enrich(video: &mut Video, detail: &Video) {
+    let fill = |slot: &mut String, value: &str| {
+        if slot.is_empty() {
+            *slot = value.to_string();
+        }
+    };
+    fill(&mut video.title, &detail.title);
+    fill(&mut video.channel, &detail.channel);
+    fill(&mut video.duration, &detail.duration);
+    fill(&mut video.views, &detail.views);
+    fill(&mut video.published, &detail.published);
+    if video.author_url.is_none() {
+        video.author_url = detail.author_url.clone();
+    }
+    if video.url.is_none() {
+        video.url = detail.url.clone();
+    }
+}
+
 fn plain(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture::app as sample;
+    use super::super::fixture::{app as sample, profiled, suggested};
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
 
@@ -1003,6 +1388,154 @@ mod tests {
         app.mode = Mode::Query;
         app.query.clear();
         app.caret = 0;
+    }
+
+    #[test]
+    fn suggestions_move_fill_and_submit() {
+        let mut app = suggested();
+        assert!(app.dropdown());
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.suggest_sel, Some(0));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.suggest_sel, Some(1));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.suggest_sel, None);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.query, "sam smith");
+        assert_eq!(app.caret, 9);
+        assert_eq!(app.mode, Mode::Query);
+    }
+
+    #[test]
+    fn escape_closes_the_dropdown_before_leaving() {
+        let mut app = suggested();
+        app.results.clear();
+        assert!(matches!(press(&mut app, KeyCode::Esc), Flow::Continue));
+        assert!(!app.dropdown());
+        assert!(matches!(press(&mut app, KeyCode::Esc), Flow::Quit));
+    }
+
+    #[test]
+    fn choosing_a_person_opens_their_profile_and_a_search_runs() {
+        let mut app = suggested();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Busy);
+        assert_eq!(app.busy, "loading profile");
+        assert!(app.suggestions.is_empty());
+
+        let mut app = suggested();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Busy);
+        assert_eq!(app.busy, "searching");
+        assert_eq!(app.query, "sam smith");
+    }
+
+    #[test]
+    fn editing_clears_the_selection_and_links_never_suggest() {
+        let mut app = suggested();
+        press(&mut app, KeyCode::Down);
+        type_text(&mut app, "x");
+        assert_eq!(app.suggest_sel, None);
+        empty_query(&mut app);
+        app.suggestions = suggested().suggestions;
+        type_text(&mut app, "https://xhamster.com/search/a");
+        assert!(app.suggestions.is_empty());
+    }
+
+    #[test]
+    fn control_s_switches_site_and_drops_old_results() {
+        let mut app = sample();
+        app.mode = Mode::Query;
+        assert_eq!(app.site, Site::YouTube);
+        control(&mut app, 's');
+        assert_eq!(app.site, Site::XHamster);
+        assert!(app.results.is_empty());
+        control(&mut app, 's');
+        assert_eq!(app.site, Site::YouTube);
+    }
+
+    #[test]
+    fn pasted_site_links_pick_the_site_and_route() {
+        let mut app = sample();
+        empty_query(&mut app);
+        app.on_paste("https://xhamster.com/creators/sample".to_string());
+        assert_eq!(app.site, Site::XHamster);
+        assert_eq!(app.mode, Mode::Busy);
+        assert_eq!(app.busy, "loading profile");
+    }
+
+    #[test]
+    fn profile_navigation_pages_sorts_and_goes_back() {
+        let mut app = profiled();
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.psel, 2);
+        press(&mut app, KeyCode::End);
+        assert_eq!(app.psel, 5);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.mode, Mode::Profile);
+        assert_eq!(app.notice.as_ref().unwrap().0, "first page");
+        press(&mut app, KeyCode::Char('s'));
+        assert_eq!(app.mode, Mode::Busy);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Profile);
+
+        let mut app = profiled();
+        app.profile.as_mut().unwrap().paging.page = 3;
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.notice.as_ref().unwrap().0, "last page");
+        app.profile.as_mut().unwrap().paging.page = 1;
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.mode, Mode::Busy);
+        assert_eq!(app.busy, "loading profile");
+    }
+
+    #[test]
+    fn opening_a_profile_video_returns_to_the_profile() {
+        let mut app = profiled();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Busy);
+        assert_eq!(app.back, Mode::Profile);
+        app.apply_resolve(
+            app.profile.as_ref().unwrap().videos[0].clone(),
+            Ok(sample().sources.clone().unwrap()),
+        );
+        assert_eq!(app.mode, Mode::Formats);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Profile);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Query);
+    }
+
+    #[test]
+    fn profile_failures_fall_back_without_a_profile() {
+        let mut app = sample();
+        app.profile = None;
+        app.back = Mode::Query;
+        app.apply_profile(Err("boom".to_string()));
+        assert_eq!(app.mode, Mode::Error);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Query);
+    }
+
+    #[test]
+    fn detail_fills_gaps_but_never_overwrites() {
+        let mut video = Video::stub("a");
+        video.title = "mine".to_string();
+        let mut detail = Video::stub("a");
+        detail.title = "theirs".to_string();
+        detail.channel = "chan".to_string();
+        detail.author_url = Some("https://x/c".to_string());
+        enrich(&mut video, &detail);
+        assert_eq!(video.title, "mine");
+        assert_eq!(video.channel, "chan");
+        assert_eq!(video.author_url.as_deref(), Some("https://x/c"));
     }
 
     #[test]

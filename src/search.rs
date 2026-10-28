@@ -14,6 +14,8 @@ pub struct Video {
     pub duration: String,
     pub views: String,
     pub published: String,
+    pub url: Option<String>,
+    pub author_url: Option<String>,
 }
 
 impl Video {
@@ -35,17 +37,6 @@ pub struct Cursor {
 pub struct Page {
     pub videos: Vec<Video>,
     pub cursor: Option<Cursor>,
-}
-
-impl Page {
-    pub fn extend(&self, into: &mut Vec<Video>) {
-        let mut seen: HashSet<String> = into.iter().map(|video| video.id.clone()).collect();
-        for video in &self.videos {
-            if seen.insert(video.id.clone()) {
-                into.push(video.clone());
-            }
-        }
-    }
 }
 
 pub fn search(query: &str) -> Result<Page, String> {
@@ -214,6 +205,7 @@ fn parse_renderer(renderer: &Value) -> Option<Video> {
         duration,
         views,
         published,
+        ..Video::default()
     })
 }
 

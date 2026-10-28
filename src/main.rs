@@ -1,13 +1,17 @@
 mod download;
+mod hls;
+mod hlsdl;
 mod innertube;
 pub mod mux;
 mod play;
 mod search;
+mod site;
 mod source;
 #[cfg(test)]
 mod testserver;
 mod tui;
 mod util;
+mod xh;
 mod ytultra;
 
 use std::env;
@@ -15,8 +19,9 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use download::{Job, Remote};
+use download::Job;
 use search::Video;
+use site::{Entry, Site};
 
 struct Args {
     query: String,
@@ -28,6 +33,7 @@ struct Args {
     limit: usize,
     player: Option<String>,
     theme: Option<tui::ThemeMode>,
+    site: Option<Site>,
     list: bool,
     help: bool,
     version: bool,
@@ -64,25 +70,40 @@ fn run() -> Result<ExitCode, String> {
             Some(name) => Some(play::choose(Some(name))?),
             None => play::detect(),
         };
-        return tui::run(args.query, out_dir, player, args.theme).map(|_| ExitCode::SUCCESS);
+        return tui::run(args.query, out_dir, player, args.theme, args.site)
+            .map(|_| ExitCode::SUCCESS);
     }
     if args.query.trim().is_empty() {
         print_help();
         return Ok(ExitCode::FAILURE);
     }
-    let page = search::search(&args.query)?;
-    let mut videos = page.videos;
-    let mut cursor = page.cursor;
-    while videos.len() < args.limit {
-        let Some(next) = cursor.take() else {
-            break;
-        };
-        let page = search::more(&next)?;
-        if page.videos.is_empty() {
-            break;
+    let mut site = args.site.unwrap_or(Site::YouTube);
+    let mut videos: Vec<Video>;
+    match site::classify(&args.query) {
+        Entry::Video(video) => videos = vec![video],
+        Entry::Profile(url) => {
+            let profile = site::profile(&url, "featured", 1)?;
+            videos = profile.videos;
         }
-        page.extend(&mut videos);
-        cursor = page.cursor;
+        Entry::Search(query) => {
+            if query != args.query.trim() {
+                site = Site::XHamster;
+            }
+            let page = site::search(site, &query)?;
+            videos = page.videos;
+            let mut cursor = page.cursor;
+            while videos.len() < args.limit {
+                let Some(next) = cursor.take() else {
+                    break;
+                };
+                let page = site::more(&next)?;
+                if page.videos.is_empty() {
+                    break;
+                }
+                page.extend(&mut videos);
+                cursor = page.cursor;
+            }
+        }
     }
     videos.truncate(args.limit);
     if videos.is_empty() {
@@ -93,7 +114,7 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     let target = &videos[0];
-    let sources = source::resolve(&target.id)?;
+    let sources = site::resolve(target)?;
     let title = sources
         .title
         .clone()
@@ -109,13 +130,13 @@ fn run() -> Result<ExitCode, String> {
             let video = sources
                 .best_video(max_height)
                 .ok_or_else(|| "no video stream".to_string())?;
-            let audio = sources.audio_for(video).map(remote);
-            play::streams(Some(&remote(video)), audio.as_ref(), &title, player)?;
+            let audio = sources.audio_for(video).map(source::Stream::remote);
+            play::streams(Some(&video.remote()), audio.as_ref(), &title, player)?;
         } else {
             let audio = sources
                 .audio()
                 .ok_or_else(|| "no audio stream".to_string())?;
-            play::streams(None, Some(&remote(audio)), &title, player)?;
+            play::streams(None, Some(&audio.remote()), &title, player)?;
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -124,7 +145,7 @@ fn run() -> Result<ExitCode, String> {
             .audio()
             .ok_or_else(|| "no audio stream".to_string())?;
         Job::Audio {
-            audio: remote(audio),
+            audio: audio.remote(),
             title,
             id: target.id.clone(),
         }
@@ -133,8 +154,8 @@ fn run() -> Result<ExitCode, String> {
             .best_video(max_height)
             .ok_or_else(|| "no video stream".to_string())?;
         Job::Video {
-            video: remote(video),
-            audio: sources.audio_for(video).map(remote),
+            video: video.remote(),
+            audio: sources.audio_for(video).map(source::Stream::remote),
             title,
             id: target.id.clone(),
         }
@@ -155,6 +176,7 @@ fn parse_args() -> Result<Args, String> {
         limit: 20,
         player: None,
         theme: None,
+        site: None,
         list: false,
         help: false,
         version: false,
@@ -195,6 +217,15 @@ fn parse_args() -> Result<Args, String> {
                     .next()
                     .ok_or_else(|| "--player needs mpv or vlc".to_string())?;
                 args.player = Some(value);
+            }
+            "--site" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--site needs youtube or xhamster".to_string())?;
+                args.site = Some(
+                    Site::parse(&value)
+                        .ok_or_else(|| "--site needs youtube or xhamster".to_string())?,
+                );
             }
             "--theme" => {
                 let value = iter
@@ -241,13 +272,6 @@ fn print_results(videos: &[Video]) {
     }
 }
 
-fn remote(stream: &source::Stream) -> Remote {
-    Remote {
-        url: stream.url.clone(),
-        ext: stream.ext.clone(),
-    }
-}
-
 fn default_dir() -> PathBuf {
     if let Ok(dir) = env::var("XDG_DOWNLOAD_DIR") {
         if !dir.is_empty() {
@@ -268,7 +292,7 @@ fn print_help() {
     let version = env!("CARGO_PKG_VERSION");
     println!(
         "snag {version}
-search youtube, then snag the audio or video
+search youtube or xhamster, then snag the audio or video
 
 usage:
   snag <query>                        open the picker
@@ -277,6 +301,8 @@ usage:
   snag --video --quality 480p <query> pick a height
   snag --play [--video] <query>       play with mpv or vlc
   snag --list <query>                 print results
+  snag --site xhamster <query>        search xhamster instead of youtube
+  snag <xhamster link>                video, profile or search links work too
 
 options:
   -a, --audio             save audio
@@ -286,6 +312,7 @@ options:
   -o, --out <dir>         output directory
   -n, --limit <count>     search results to show (default 20)
       --player <name>     mpv or vlc, default whatever is installed
+      --site <name>       youtube or xhamster (ctrl-s switches in the picker)
       --theme <mode>      auto, light or dark (ctrl-t cycles in the picker)
   -l, --list              print results and exit
   -h, --help              show this help
@@ -293,9 +320,11 @@ options:
 
 files land in $XDG_DOWNLOAD_DIR, ~/Downloads or $HOME.
 video and audio are merged by snag itself; playback needs mpv or vlc.
-streams come straight from youtube with ytultra alongside; in the picker
-press tab to switch which provider's sources you are looking at.
-the picker takes mouse clicks, remembers searches (up arrow) and offers a
-youtube link from your clipboard (tab)."
+youtube streams come straight from youtube with ytultra alongside; xhamster
+streams come from the page's initials data and from the page source. in the
+picker press tab to switch which provider's sources you are looking at.
+the picker suggests searches as you type, opens creator, channel and pornstar
+profiles, takes mouse clicks, remembers searches (up arrow) and offers a link
+from your clipboard (tab)."
     );
 }

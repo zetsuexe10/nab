@@ -4,14 +4,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
-use super::app::{App, Hit, Mode, Zone};
+use super::app::{App, Hit, Mode, Zone, SUGGEST_MAX};
 use super::logo;
 use super::theme::{clock, fit, join, pad, tilde, width, wrap, Theme};
 use crate::download::Stage;
 use crate::play::Player;
 use crate::search::Video;
+use crate::site::Suggestion;
 use crate::source::Kind;
-use crate::util::human_size;
+use crate::util::{human_size, short_count};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 const BUTTON: &str = "snag";
@@ -22,6 +23,7 @@ const SEPARATOR: &str = "  ·  ";
 const HEADER: u16 = 7;
 const WIDE: u16 = 76;
 const STACK_BELOW: u16 = 64;
+const SIDE: u16 = 28;
 
 struct Hint {
     key: String,
@@ -36,6 +38,10 @@ fn hint(key: &str, label: impl Into<String>) -> Hint {
         "⇥" => Some((KeyCode::Tab, KeyModifiers::NONE)),
         "^c" => Some((KeyCode::Char('c'), KeyModifiers::CONTROL)),
         "^t" => Some((KeyCode::Char('t'), KeyModifiers::CONTROL)),
+        "^s" => Some((KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        "←" => Some((KeyCode::Left, KeyModifiers::NONE)),
+        "→" => Some((KeyCode::Right, KeyModifiers::NONE)),
+        "↓" => Some((KeyCode::Down, KeyModifiers::NONE)),
         other if other.chars().count() == 1 => other
             .chars()
             .next()
@@ -152,6 +158,7 @@ impl App {
         match self.mode {
             Mode::Query => "Search or paste a link",
             Mode::Busy if self.busy == "searching" => "Searching",
+            Mode::Busy if self.busy == "loading profile" => "Loading profile",
             Mode::Busy => "Resolving",
             _ => "Search",
         }
@@ -165,8 +172,12 @@ impl App {
                 if !self.history.is_empty() {
                     hints.push(hint("↑", "history"));
                 }
-                if self.offered().is_some() {
+                if self.suggest_sel.is_some() {
+                    hints.push(hint("⇥", "fill"));
+                } else if self.offered().is_some() {
                     hints.push(hint("⇥", "paste"));
+                } else if self.dropdown() {
+                    hints.push(hint("↓", "suggestions"));
                 } else if !self.results.is_empty() {
                     hints.push(hint("↓", "results"));
                 }
@@ -178,6 +189,7 @@ impl App {
                         "back"
                     },
                 ));
+                hints.push(hint("^s", format!("site:{}", self.site.label())));
                 hints.push(hint("^c", "quit"));
             }
             Mode::Busy => {
@@ -187,14 +199,36 @@ impl App {
             Mode::Results => {
                 hints.push(hint("↵", "open"));
                 hints.push(hint("↑↓", "move"));
+                if self
+                    .results
+                    .get(self.sel)
+                    .is_some_and(|video| video.author_url.is_some())
+                {
+                    hints.push(hint("o", "profile"));
+                }
                 hints.push(hint("/", "search"));
                 hints.push(hint("^c", "quit"));
+            }
+            Mode::Profile => {
+                hints.push(hint("↵", "open"));
+                hints.push(hint("↑↓", "move"));
+                hints.push(hint("←", "prev"));
+                hints.push(hint("→", "next"));
+                hints.push(hint("s", format!("sort:{}", self.sort_label())));
+                hints.push(hint("esc", "back"));
             }
             Mode::Formats => {
                 hints.push(hint("↵", "download"));
                 hints.push(hint("↑↓", "move"));
                 hints.push(hint("p", "play"));
                 self.player_hints(&mut hints);
+                if self
+                    .current
+                    .as_ref()
+                    .is_some_and(|video| video.author_url.is_some())
+                {
+                    hints.push(hint("o", "profile"));
+                }
                 if self.providers().len() > 1 {
                     hints.push(hint("⇥", self.provider.unwrap_or("source")));
                 }
@@ -293,7 +327,7 @@ impl App {
             area.width,
             Line::styled(
                 fit(
-                    "search youtube, pick a stream, snag it",
+                    &format!("search {}, pick a stream, snag it", self.site.label()),
                     area.width as usize,
                 ),
                 theme.text(),
@@ -316,7 +350,20 @@ impl App {
 
     fn body_height(&self, avail: u16, wide: u16) -> u16 {
         match self.mode {
-            Mode::Query | Mode::Busy => 4,
+            Mode::Query | Mode::Busy => 4 + (SUGGEST_MAX as u16 + 2).min(avail.saturating_sub(4)),
+            Mode::Profile => {
+                let want = 2 + 2 * self.profile_videos().max(1) as u16;
+                if wide < STACK_BELOW {
+                    if avail < 8 {
+                        want.min(avail.max(3))
+                    } else {
+                        3 + want.min(avail - 3)
+                    }
+                } else {
+                    want.min(avail.max(3))
+                        .max((self.profile_left(SIDE as usize).len() as u16).min(avail))
+                }
+            }
             Mode::Results => {
                 let want = 2 + 2 * self.results.len().max(1) as u16;
                 if avail < 8 {
@@ -357,8 +404,13 @@ impl App {
         match self.mode {
             Mode::Query | Mode::Busy => {
                 self.draw_input(frame, theme, x, y, wide);
-                self.draw_status(frame, theme, x, y + 3, wide);
+                if self.dropdown() {
+                    self.draw_dropdown(frame, theme, x, y + 3, wide, tall.saturating_sub(3));
+                } else {
+                    self.draw_status(frame, theme, x, y + 3, wide);
+                }
             }
+            Mode::Profile => self.draw_profile(frame, theme, x, y, wide, tall),
             Mode::Results => self.draw_results(frame, theme, x, y, wide, tall),
             Mode::Formats => self.draw_formats(frame, theme, x, y, wide, tall),
             Mode::Download => self.draw_download(frame, theme, x, y, wide),
@@ -402,9 +454,221 @@ impl App {
         }
     }
 
+    fn input_span(wide: u16) -> u16 {
+        wide.saturating_sub((BUTTON.len() + 4) as u16).max(8)
+    }
+
+    fn suggestion_row(&self, index: usize, room: usize) -> Line<'static> {
+        let theme = Theme::of(self.theme);
+        let row: &Suggestion = &self.suggestions[index];
+        let selected = self.suggest_sel == Some(index);
+        let count = row.count.map(short_count).unwrap_or_default();
+        let tag = join(&[row.tag, &count]);
+        let head = room.saturating_sub(2 + width(&tag) + 1);
+        let style = if selected { theme.pick() } else { theme.text() };
+        Line::from(vec![
+            Span::styled(if selected { "❯ " } else { "  " }, theme.pick()),
+            Span::styled(pad(&fit(&row.text, head), head), style),
+            Span::styled(format!(" {tag}"), theme.soft()),
+        ])
+    }
+
+    fn draw_dropdown(
+        &mut self,
+        frame: &mut Frame,
+        theme: &Theme,
+        x: u16,
+        y: u16,
+        wide: u16,
+        tall: u16,
+    ) {
+        let span = Self::input_span(wide);
+        let rows = (tall.saturating_sub(2) as usize).min(self.suggestions.len());
+        if rows == 0 {
+            return;
+        }
+        let inner = (span as usize).saturating_sub(6);
+        let lines: Vec<Line<'static>> = (0..rows)
+            .map(|index| self.suggestion_row(index, inner))
+            .collect();
+        let area = frame.area();
+        for (offset, line) in panel(theme, "Suggestions", span, lines)
+            .into_iter()
+            .enumerate()
+        {
+            put(frame, x, y + offset as u16, span, line);
+        }
+        for index in 0..rows {
+            self.zone(
+                rect(area, x, y + 1 + index as u16, span, 1),
+                Hit::Suggest(index),
+            );
+        }
+    }
+
+    fn profile_left(&self, room: usize) -> Vec<Line<'static>> {
+        let theme = Theme::of(self.theme);
+        let Some(profile) = &self.profile else {
+            return Vec::new();
+        };
+        let soft = |text: String| Line::styled(fit(&format!("▸ {text}"), room), theme.soft());
+        let name = if profile.verified {
+            format!("{} ✓", profile.name)
+        } else {
+            profile.name.clone()
+        };
+        let mut lines: Vec<Line<'static>> = wrap(&name, room)
+            .into_iter()
+            .take(2)
+            .map(|line| Line::styled(line, theme.bold()))
+            .collect();
+        let handle = profile
+            .handle
+            .as_ref()
+            .map(|handle| format!("@{}", handle.trim_start_matches('@')))
+            .unwrap_or_default();
+        lines.push(soft(join(&[profile.kind.label(), &handle])));
+        let place = join(&[
+            profile.country.as_deref().unwrap_or(""),
+            profile.gender.as_deref().unwrap_or(""),
+        ]);
+        if !place.is_empty() {
+            lines.push(soft(place));
+        }
+        lines.push(Line::raw(""));
+        if let Some(count) = profile.subscribers {
+            lines.push(soft(format!("{} subscribers", short_count(count))));
+        }
+        if let Some(count) = profile.video_count {
+            lines.push(soft(format!("{} videos", short_count(count))));
+        }
+        if let Some(count) = profile.views {
+            lines.push(soft(format!("{} views", short_count(count))));
+        }
+        if !profile.aliases.is_empty() {
+            lines.push(soft(format!("aka {}", profile.aliases.join(", "))));
+        }
+        for (key, value) in profile.info.iter().take(3) {
+            lines.push(soft(format!("{key}: {value}")));
+        }
+        if !profile.socials.is_empty() {
+            let names: Vec<&str> = profile
+                .socials
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            lines.push(soft(format!("links: {}", names.join(", "))));
+        }
+        if let Some(bio) = profile.bio.as_ref().filter(|bio| !bio.is_empty()) {
+            lines.push(Line::raw(""));
+            for line in wrap(bio, room).into_iter().take(3) {
+                lines.push(Line::styled(line, theme.soft()));
+            }
+        }
+        lines
+    }
+
+    fn draw_profile(
+        &mut self,
+        frame: &mut Frame,
+        theme: &Theme,
+        x: u16,
+        y: u16,
+        wide: u16,
+        tall: u16,
+    ) {
+        let Some(profile) = self.profile.as_ref() else {
+            return;
+        };
+        let stacked = wide < STACK_BELOW;
+        let paging = profile.paging.clone();
+        let summary = join(&[
+            profile.kind.label(),
+            &profile
+                .subscribers
+                .map(|count| format!("{} subscribers", short_count(count)))
+                .unwrap_or_default(),
+            &profile
+                .video_count
+                .map(|count| format!("{} videos", short_count(count)))
+                .unwrap_or_default(),
+        ]);
+        let heading = if profile.verified {
+            format!("{} ✓", profile.name)
+        } else {
+            profile.name.clone()
+        };
+        let (px, py, pw, ph) = if stacked {
+            let head = tall.min(3);
+            if head >= 2 {
+                put(
+                    frame,
+                    x,
+                    y,
+                    wide,
+                    Line::styled(fit(&heading, wide as usize), theme.bold()),
+                );
+                put(
+                    frame,
+                    x,
+                    y + 1,
+                    wide,
+                    Line::styled(fit(&summary, wide as usize), theme.soft()),
+                );
+            }
+            (x, y + head, wide, tall.saturating_sub(head).max(3))
+        } else {
+            for (row, line) in self
+                .profile_left(SIDE as usize)
+                .into_iter()
+                .take(tall as usize)
+                .enumerate()
+            {
+                put(frame, x, y + row as u16, SIDE, line);
+            }
+            (x + SIDE + 2, y, wide - SIDE - 2, tall)
+        };
+        let rows = (ph.saturating_sub(2) / 2).max(1) as usize;
+        if self.psel < self.pscroll {
+            self.pscroll = self.psel;
+        }
+        if self.psel >= self.pscroll + rows {
+            self.pscroll = self.psel + 1 - rows;
+        }
+        let inner = (pw as usize).saturating_sub(6);
+        let count = self.profile_videos();
+        let last = (self.pscroll + rows).min(count);
+        let mut lines = Vec::new();
+        if let Some(profile) = &self.profile {
+            for index in self.pscroll..last {
+                let [first, second] =
+                    self.result_rows(&profile.videos[index], index == self.psel, inner);
+                lines.push(first);
+                lines.push(second);
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::styled("no videos here", theme.soft()));
+        }
+        let place = if paging.last > 0 {
+            format!("page {}/{}", paging.page, paging.last)
+        } else {
+            format!("page {}", paging.page)
+        };
+        let title = join(&["Videos", &place, &self.sort_label()]);
+        let area = frame.area();
+        for (offset, line) in panel(theme, &title, pw, lines).into_iter().enumerate() {
+            put(frame, px, py + offset as u16, pw, line);
+        }
+        for index in self.pscroll..last {
+            let row = py + 1 + ((index - self.pscroll) * 2) as u16;
+            self.zone(rect(area, px, row, pw, 2), Hit::Result(index));
+        }
+    }
+
     fn draw_input(&mut self, frame: &mut Frame, theme: &Theme, x: u16, y: u16, wide: u16) {
         let button = (BUTTON.len() + 4) as u16;
-        let span = wide.saturating_sub(button).max(8);
+        let span = Self::input_span(wide);
         let inner = span as usize - 2;
         let editing = self.mode == Mode::Query;
         let dim = self.mode == Mode::Busy;
@@ -426,7 +690,10 @@ impl App {
         let mut spans = vec![Span::styled("│ ", soft), Span::styled("❯ ", theme.text())];
         if self.query.is_empty() && editing {
             spans.push(Span::styled(
-                fit("search youtube or paste a link…", room),
+                fit(
+                    &format!("search {} or paste a link…", self.site.label()),
+                    room,
+                ),
                 soft,
             ));
             frame.set_cursor_position((x + 4, y + 1));
@@ -906,7 +1173,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixture::app;
+    use super::super::fixture::{app, profiled, suggested};
     use super::super::theme::ThemeMode;
     use super::*;
     use ratatui::backend::TestBackend;
@@ -946,6 +1213,109 @@ mod tests {
         assert!(screen.lines().any(|line| line.ends_with("  snag")));
         assert!(screen.contains("↵ search"));
         assert!(screen.contains("^t theme:auto"));
+    }
+
+    #[test]
+    fn dropdown_lists_suggestions_with_tags_inside_the_frame() {
+        let mut app = suggested();
+        app.suggest_sel = Some(1);
+        let screen = draw(&mut app, 90, 30);
+        assert!(screen.contains("╭─ Suggestions"));
+        assert!(screen.contains("  sam smith"));
+        assert!(screen.contains("❯ Sample Creator"));
+        assert!(screen.contains("creator · 88"));
+        assert!(screen.contains("^s site:youtube"));
+        for line in screen.lines() {
+            assert!(width(line) <= 90, "{line}");
+        }
+        assert!(!app.zones.is_empty());
+    }
+
+    #[test]
+    fn profile_shows_details_beside_a_paged_video_panel() {
+        let mut app = profiled();
+        let screen = draw(&mut app, 100, 32);
+        assert!(screen.contains("Sample Creator ✓"));
+        assert!(screen.contains("creator · @sample"));
+        assert!(screen.contains("Norway · female"));
+        assert!(screen.contains("120K subscribers"));
+        assert!(screen.contains("aka Sam, Sammy"));
+        assert!(screen.contains("╭─ Videos · page 1/3 · featured"));
+        assert!(screen.contains("❯ Profile clip number 0"));
+        assert!(screen.contains("sort:featured"));
+        for line in screen.lines() {
+            assert!(width(line) <= 100, "{line}");
+        }
+    }
+
+    #[test]
+    fn profile_stacks_and_survives_tiny_terminals() {
+        let mut app = profiled();
+        let screen = draw(&mut app, 50, 24);
+        assert!(screen.contains("Sample Creator ✓"));
+        assert!(screen.contains("Videos · page 1/3"));
+        for (wide, tall) in [(16, 5), (30, 8), (40, 12), (64, 14), (120, 50)] {
+            let mut app = profiled();
+            app.psel = 5;
+            let screen = draw(&mut app, wide, tall);
+            for line in screen.lines() {
+                assert!(width(line) <= wide as usize, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn query_placeholder_names_the_site() {
+        let mut app = app();
+        app.mode = Mode::Query;
+        app.query.clear();
+        app.caret = 0;
+        app.site = crate::site::Site::XHamster;
+        let screen = draw(&mut app, 90, 30);
+        assert!(screen.contains("search xhamster or paste a link…"));
+        assert!(screen.contains("^s site:xhamster"));
+    }
+
+    #[test]
+    fn every_screen_renders_at_every_size_without_panicking() {
+        let sizes = [
+            (1, 1),
+            (16, 5),
+            (20, 6),
+            (30, 9),
+            (45, 13),
+            (63, 20),
+            (64, 24),
+            (80, 40),
+            (200, 60),
+        ];
+        for (wide, tall) in sizes {
+            for mode in [
+                Mode::Query,
+                Mode::Results,
+                Mode::Formats,
+                Mode::Profile,
+                Mode::Busy,
+                Mode::Download,
+                Mode::Done,
+                Mode::Error,
+            ] {
+                let mut screen = profiled();
+                screen.suggestions = suggested().suggestions;
+                screen.suggest_sel = Some(1);
+                screen.query = "sam".to_string();
+                screen.caret = 3;
+                screen.error = "something failed with a long message ".repeat(4);
+                screen.mode = mode;
+                let text = draw(&mut screen, wide, tall);
+                for line in text.lines() {
+                    assert!(
+                        width(line) <= wide as usize,
+                        "{mode:?} {wide}x{tall}: {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

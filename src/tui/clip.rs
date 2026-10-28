@@ -1,6 +1,7 @@
 use std::process::{Command, Stdio};
 
 use crate::search;
+use crate::xh;
 
 const READERS: &[&[&str]] = &[
     &["pbpaste"],
@@ -35,7 +36,9 @@ pub fn link(text: &str) -> Option<String> {
     if first.is_empty() || first.contains(char::is_whitespace) {
         return None;
     }
-    search::video_id(first)?;
+    if xh::classify(first).is_none() {
+        search::video_id(first)?;
+    }
     Some(first.to_string())
 }
 
