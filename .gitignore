@@ -1,0 +1,9 @@
+/target
+/dist
+/artifacts
+.snag-*
+ytx/
+youtube/
+*.har
+wh.txt
+yt-ext.txt
