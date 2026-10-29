@@ -3,14 +3,10 @@ use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
 
-const ART: [&str; 3] = [
-    "█▀▀ █▀▄█ █▀█ █▀▀▀",
-    "▀▀▓ █  ▓ █▀█ █ ▀▓",
-    "▀▀▀ ▀  ▀ ▀ ▀ ▀▀▀▀",
-];
+const ART: [&str; 3] = ["█▄ █ ▄▀▀▄ █▀▀▄", "█ ▀█ █▀▀█ █▀▀▄", "▀  ▀ ▀  ▀ ▀▀▀ "];
 
 pub const HEIGHT: u16 = 3;
-pub const WIDTH: u16 = 17;
+pub const WIDTH: u16 = 14;
 
 const INTRO_MS: u64 = 900;
 const SPREAD_MS: u64 = 550;

@@ -1,17 +1,12 @@
 use crate::download::Remote;
-use crate::innertube;
-use crate::search::Video;
-use crate::xh;
-use crate::ytultra;
-
-pub const INNERTUBE: &str = "innertube";
-pub const YTULTRA: &str = "ytultra";
+use crate::model::{Photo, Video};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Muxed,
     Video,
     Audio,
+    Gallery,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +18,8 @@ pub struct Stream {
     pub size: u64,
     pub url: String,
     pub height: u32,
+    pub referer: Option<&'static str>,
+    pub extract: bool,
 }
 
 impl Stream {
@@ -30,12 +27,16 @@ impl Stream {
         self.kind == Kind::Audio
     }
 
+    pub fn is_gallery(&self) -> bool {
+        self.kind == Kind::Gallery
+    }
+
     pub fn remote(&self) -> Remote {
         Remote {
             url: self.url.clone(),
             ext: self.ext.clone(),
-            referer: matches!(self.provider, xh::INITIALS | xh::PAGE)
-                .then(|| xh::REFERER.to_string()),
+            referer: self.referer.map(str::to_string),
+            extract: self.extract,
         }
     }
 }
@@ -45,6 +46,8 @@ pub struct Sources {
     pub title: Option<String>,
     pub streams: Vec<Stream>,
     pub detail: Option<Video>,
+    pub photos: Vec<Photo>,
+    pub preferred: Option<&'static str>,
 }
 
 impl Sources {
@@ -55,6 +58,12 @@ impl Sources {
         if self.detail.is_none() {
             self.detail = other.detail;
         }
+        if self.preferred.is_none() {
+            self.preferred = other.preferred;
+        }
+        if self.photos.is_empty() {
+            self.photos = other.photos;
+        }
         for stream in other.streams {
             if stream.url.is_empty() {
                 continue;
@@ -62,7 +71,7 @@ impl Sources {
             if self
                 .streams
                 .iter()
-                .any(|existing| existing.url == stream.url)
+                .any(|existing| existing.url == stream.url && existing.extract == stream.extract)
             {
                 continue;
             }
@@ -72,11 +81,13 @@ impl Sources {
     }
 
     pub fn sort(&mut self) {
+        let preferred = self.preferred;
         self.streams.sort_by(|left, right| {
             (!left.is_audio())
                 .cmp(&(!right.is_audio()))
                 .then_with(|| {
-                    let first = (left.provider != INNERTUBE).cmp(&(right.provider != INNERTUBE));
+                    let first = (Some(left.provider) != preferred)
+                        .cmp(&(Some(right.provider) != preferred));
                     if left.is_audio() {
                         first.then(right.size.cmp(&left.size))
                     } else {
@@ -101,24 +112,31 @@ impl Sources {
         seen
     }
 
+    pub fn default_provider(&self) -> Option<&'static str> {
+        let providers = self.providers();
+        self.preferred
+            .filter(|wanted| providers.contains(wanted))
+            .or(providers.first().copied())
+    }
+
     pub fn audio(&self) -> Option<&Stream> {
         self.streams.iter().find(|stream| stream.is_audio())
     }
 
     pub fn audio_for(&self, video: &Stream) -> Option<&Stream> {
-        if video.kind == Kind::Muxed {
+        if video.kind != Kind::Video {
             return None;
         }
         let wanted = if video.ext == "webm" { "weba" } else { "m4a" };
         self.streams
             .iter()
-            .find(|stream| stream.is_audio() && stream.ext == wanted)
+            .find(|stream| stream.is_audio() && !stream.extract && stream.ext == wanted)
     }
 
     pub fn videos(&self) -> Vec<&Stream> {
         self.streams
             .iter()
-            .filter(|stream| !stream.is_audio())
+            .filter(|stream| matches!(stream.kind, Kind::Video | Kind::Muxed))
             .collect()
     }
 
@@ -127,60 +145,18 @@ impl Sources {
             .into_iter()
             .find(|stream| max_height.is_none_or(|max| stream.height <= max))
     }
-}
 
-pub fn resolve(id: &str) -> Result<Sources, String> {
-    let mut sources = Sources::default();
-    let mut errors: Vec<String> = Vec::new();
-    match innertube::resolve(id) {
-        Ok(direct) => sources.merge(direct),
-        Err(error) => errors.push(format!("{INNERTUBE}: {error}")),
-    }
-    match ytultra::resolve(id) {
-        Ok(resolved) => sources.merge(from_ytultra(resolved)),
-        Err(error) => errors.push(format!("{YTULTRA}: {error}")),
-    }
-    if sources.streams.is_empty() {
-        return Err(if errors.is_empty() {
-            "no downloadable streams".to_string()
-        } else {
-            errors.join("; ")
-        });
-    }
-    Ok(sources)
-}
-
-fn from_ytultra(resolved: ytultra::Resolved) -> Sources {
-    let mut streams = Vec::new();
-    for media in resolved.medias.iter().filter(|media| media.available()) {
-        let Some(url) = media.url.clone() else {
-            continue;
-        };
-        let kind = if media.is_audio() {
-            Kind::Audio
-        } else {
-            Kind::Video
-        };
-        streams.push(Stream {
-            provider: YTULTRA,
-            kind,
-            quality: media.quality.clone(),
-            ext: media.extension(),
-            size: media.size,
-            url,
-            height: media.height(),
-        });
-    }
-    Sources {
-        title: resolved.title,
-        streams,
-        detail: None,
+    pub fn gallery(&self) -> Option<&Stream> {
+        self.streams.iter().find(|stream| stream.is_gallery())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALPHA: &str = "alpha";
+    const BETA: &str = "beta";
 
     fn stream(provider: &'static str, kind: Kind, quality: &str, ext: &str, size: u64) -> Stream {
         Stream {
@@ -196,6 +172,8 @@ mod tests {
                 .collect::<String>()
                 .parse()
                 .unwrap_or(0),
+            referer: None,
+            extract: false,
         }
     }
 
@@ -204,10 +182,10 @@ mod tests {
         sources.merge(Sources {
             title: Some("clip".into()),
             streams: vec![
-                stream(YTULTRA, Kind::Video, "480p", "mp4", 2_000_000),
-                stream(YTULTRA, Kind::Video, "720p", "webm", 3_000_000),
-                stream(YTULTRA, Kind::Audio, "128k", "m4a", 5_000_000),
-                stream(YTULTRA, Kind::Audio, "128k", "weba", 5_500_000),
+                stream(BETA, Kind::Video, "480p", "mp4", 2_000_000),
+                stream(BETA, Kind::Video, "720p", "webm", 3_000_000),
+                stream(BETA, Kind::Audio, "128k", "m4a", 5_000_000),
+                stream(BETA, Kind::Audio, "128k", "weba", 5_500_000),
             ],
             ..Sources::default()
         });
@@ -245,10 +223,9 @@ mod tests {
     fn muxed_streams_need_no_audio() {
         let mut sources = Sources::default();
         sources.merge(Sources {
-            title: None,
             streams: vec![
-                stream(INNERTUBE, Kind::Muxed, "360p", "mp4", 4_000_000),
-                stream(INNERTUBE, Kind::Audio, "128k", "m4a", 1_000_000),
+                stream(ALPHA, Kind::Muxed, "360p", "mp4", 4_000_000),
+                stream(ALPHA, Kind::Audio, "128k", "m4a", 1_000_000),
             ],
             ..Sources::default()
         });
@@ -257,73 +234,66 @@ mod tests {
     }
 
     #[test]
-    fn hides_locked_ytultra_streams() {
-        let resolved = ytultra::Resolved {
-            title: Some("Khola Janala".into()),
-            medias: vec![
-                ytultra::Media {
-                    url: None,
-                    quality: "1080p".into(),
-                    format: "1080p (77.16 MB) [.mp4]".into(),
-                    size: 80_911_999,
-                    locked: true,
-                },
-                ytultra::Media {
-                    url: Some("https://v/720".into()),
-                    quality: "720p".into(),
-                    format: "720p (25.23 MB) [.mp4]".into(),
-                    size: 26_455_880,
-                    locked: false,
-                },
-                ytultra::Media {
-                    url: Some("https://a/m4a".into()),
-                    quality: "720p".into(),
-                    format: "720p (3.29 MB) [.m4a]".into(),
-                    size: 3_449_447,
-                    locked: false,
-                },
+    fn extracted_audio_is_never_paired_with_video() {
+        let mut extracted = stream(ALPHA, Kind::Audio, "audio", "m4a", 1_000_000);
+        extracted.extract = true;
+        let mut sources = Sources::default();
+        sources.merge(Sources {
+            streams: vec![
+                stream(ALPHA, Kind::Video, "720p", "mp4", 4_000_000),
+                extracted,
             ],
-        };
-        let sources = from_ytultra(resolved);
-        assert_eq!(sources.title.as_deref(), Some("Khola Janala"));
-        assert_eq!(sources.streams.len(), 2);
-        assert!(sources.streams.iter().all(|stream| stream.size > 0));
-        assert_eq!(sources.best_video(None).unwrap().quality, "720p");
-        assert_eq!(sources.audio().unwrap().ext, "m4a");
+            ..Sources::default()
+        });
+        let video = sources.best_video(None).unwrap();
+        assert!(sources.audio_for(video).is_none());
+        assert!(sources.audio().unwrap().extract);
     }
 
     #[test]
     fn merges_providers_without_duplicates() {
         let mut sources = sample();
         sources.merge(Sources {
-            title: None,
+            preferred: Some(ALPHA),
             streams: vec![
-                stream(INNERTUBE, Kind::Muxed, "720p", "mp4", 9_000_000),
-                stream(INNERTUBE, Kind::Audio, "128k", "m4a", 1_000_000),
+                stream(ALPHA, Kind::Muxed, "720p", "mp4", 9_000_000),
+                stream(ALPHA, Kind::Audio, "128k", "m4a", 1_000_000),
             ],
             ..Sources::default()
         });
         assert_eq!(sources.streams.len(), 6);
-        assert_eq!(sources.providers(), vec![INNERTUBE, YTULTRA]);
-        assert_eq!(sources.best_video(None).unwrap().provider, INNERTUBE);
-        assert_eq!(sources.audio().unwrap().provider, INNERTUBE);
+        assert_eq!(sources.providers(), vec![ALPHA, BETA]);
+        assert_eq!(sources.best_video(None).unwrap().provider, ALPHA);
+        assert_eq!(sources.audio().unwrap().provider, ALPHA);
+        assert_eq!(sources.default_provider(), Some(ALPHA));
     }
 
     #[test]
-    fn innertube_leads_when_both_providers_answer() {
+    fn the_preferred_provider_leads_when_both_answer() {
         let mut sources = Sources {
-            title: None,
-            streams: vec![stream(YTULTRA, Kind::Video, "720p", "mp4", 8_000_000)],
+            streams: vec![stream(BETA, Kind::Video, "720p", "mp4", 8_000_000)],
             ..Sources::default()
         };
         sources.merge(Sources {
-            title: None,
-            streams: vec![stream(INNERTUBE, Kind::Video, "720p", "mp4", 5_000_000)],
+            preferred: Some(ALPHA),
+            streams: vec![stream(ALPHA, Kind::Video, "720p", "mp4", 5_000_000)],
             ..Sources::default()
         });
-        assert_eq!(sources.providers(), vec![INNERTUBE, YTULTRA]);
+        assert_eq!(sources.providers(), vec![ALPHA, BETA]);
         let best = sources.best_video(None).unwrap();
-        assert_eq!(best.provider, INNERTUBE);
+        assert_eq!(best.provider, ALPHA);
         assert!(sources.best_video(Some(480)).is_none());
+    }
+
+    #[test]
+    fn galleries_are_neither_video_nor_audio() {
+        let mut sources = Sources::default();
+        sources.merge(Sources {
+            streams: vec![stream(ALPHA, Kind::Gallery, "12 photos", "folder", 0)],
+            ..Sources::default()
+        });
+        assert!(sources.best_video(None).is_none());
+        assert!(sources.audio().is_none());
+        assert!(sources.gallery().is_some());
     }
 }

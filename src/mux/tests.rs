@@ -5,7 +5,7 @@ use super::synth::{self, Frame};
 use super::{merge, mp4, pairs, sniff, webm, Container};
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("snag-mux-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("nab-mux-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
@@ -247,4 +247,39 @@ fn damaged_inputs_fail_cleanly_instead_of_panicking() {
             survives(&dir, v, &bent, v_ext, a_ext);
         }
     }
+}
+
+#[test]
+fn extracts_the_audio_track_alone_from_joined_and_fragmented_mp4() {
+    let dir = scratch("extract");
+    let video = synth::frames(true, 9, 1);
+    let audio = synth::frames(false, 14, 2);
+    let joined = dir.join("joined.mp4");
+    fs::write(
+        dir.join("v.mp4"),
+        synth::progressive(true, &video, 15360, 512),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("a.m4a"),
+        synth::fragmented(false, &audio, 44100, 1024),
+    )
+    .unwrap();
+    merge(&dir.join("v.mp4"), &dir.join("a.m4a"), &joined).unwrap();
+    for source in [joined.clone(), dir.join("a.m4a")] {
+        let out = dir.join("only.m4a");
+        super::extract_audio(&source, &out).unwrap();
+        assert_eq!(sniff(&out).unwrap(), Container::Mp4);
+        let mut part = mp4::demux(&out).unwrap().into_part(b"soun").unwrap();
+        assert!(mp4::demux(&out).unwrap().into_part(b"vide").is_err());
+        assert_eq!(part.track.samples.len(), audio.len());
+        let got = payloads(&mut part);
+        for (index, frame) in audio.iter().enumerate() {
+            assert_eq!(got[index], frame.data);
+        }
+    }
+    let first = synth::frames(true, 1, 1).remove(0);
+    fs::write(dir.join("v.webm"), synth::webm(true, &[(0, first)])).unwrap();
+    assert!(super::extract_audio(&dir.join("v.webm"), &dir.join("x.m4a")).is_err());
+    assert!(super::extract_audio(&dir.join("v.mp4"), &dir.join("x.m4a")).is_err());
 }

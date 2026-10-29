@@ -8,15 +8,15 @@ use super::app::{App, Hit, Mode, Zone, SUGGEST_MAX};
 use super::logo;
 use super::theme::{clock, fit, join, pad, tilde, width, wrap, Theme};
 use crate::download::Stage;
+use crate::model::{Scope, Video};
 use crate::play::Player;
-use crate::search::Video;
-use crate::site::Suggestion;
+use crate::sites::Suggestion;
 use crate::source::Kind;
 use crate::util::{human_size, short_count};
 
 const SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-const BUTTON: &str = "snag";
-const AGAIN: &str = "↵ snag another";
+const BUTTON: &str = "nab";
+const AGAIN: &str = "↵ nab another";
 const BAR: usize = 30;
 const PANEL: u16 = 40;
 const SEPARATOR: &str = "  ·  ";
@@ -190,6 +190,9 @@ impl App {
                     },
                 ));
                 hints.push(hint("^s", format!("site:{}", self.site.label())));
+                if self.site.scopes().len() > 1 {
+                    hints.push(hint("^g", format!("find:{}", self.scope.label())));
+                }
                 hints.push(hint("^c", "quit"));
             }
             Mode::Busy => {
@@ -214,14 +217,25 @@ impl App {
                 hints.push(hint("↑↓", "move"));
                 hints.push(hint("←", "prev"));
                 hints.push(hint("→", "next"));
-                hints.push(hint("s", format!("sort:{}", self.sort_label())));
+                if self
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.scope == Scope::Videos)
+                {
+                    hints.push(hint("s", format!("sort:{}", self.sort_label())));
+                }
+                if self.profile_scopes() > 1 {
+                    hints.push(hint("t", "videos/galleries"));
+                }
                 hints.push(hint("esc", "back"));
             }
             Mode::Formats => {
                 hints.push(hint("↵", "download"));
                 hints.push(hint("↑↓", "move"));
-                hints.push(hint("p", "play"));
-                self.player_hints(&mut hints);
+                if !self.gallery_selected() {
+                    hints.push(hint("p", "play"));
+                    self.player_hints(&mut hints);
+                }
                 if self
                     .current
                     .as_ref()
@@ -241,9 +255,11 @@ impl App {
                 hints.push(hint("^c", "quit"));
             }
             Mode::Done => {
-                hints.push(hint("↵", "snag another"));
-                hints.push(hint("p", "play"));
-                self.player_hints(&mut hints);
+                hints.push(hint("↵", "nab another"));
+                if !self.saved_gallery {
+                    hints.push(hint("p", "play"));
+                    self.player_hints(&mut hints);
+                }
                 hints.push(hint("esc", "back"));
             }
             Mode::Error => {
@@ -327,7 +343,7 @@ impl App {
             area.width,
             Line::styled(
                 fit(
-                    &format!("search {}, pick a stream, snag it", self.site.label()),
+                    &format!("search {}, pick a stream, nab it", self.site.label()),
                     area.width as usize,
                 ),
                 theme.text(),
@@ -439,7 +455,7 @@ impl App {
         } else if self.mode == Mode::Query && self.offered().is_some() {
             Some("link in your clipboard — ⇥ to paste it".to_string())
         } else if self.mode == Mode::Query && self.clip_taken && !self.query.is_empty() {
-            Some("↵ to snag it".to_string())
+            Some("↵ to nab it".to_string())
         } else {
             None
         };
@@ -527,7 +543,7 @@ impl App {
             .as_ref()
             .map(|handle| format!("@{}", handle.trim_start_matches('@')))
             .unwrap_or_default();
-        lines.push(soft(join(&[profile.kind.label(), &handle])));
+        lines.push(soft(join(&[profile.kind, &handle])));
         let place = join(&[
             profile.country.as_deref().unwrap_or(""),
             profile.gender.as_deref().unwrap_or(""),
@@ -541,6 +557,9 @@ impl App {
         }
         if let Some(count) = profile.video_count {
             lines.push(soft(format!("{} videos", short_count(count))));
+        }
+        if let Some(count) = profile.gallery_count {
+            lines.push(soft(format!("{} galleries", short_count(count))));
         }
         if let Some(count) = profile.views {
             lines.push(soft(format!("{} views", short_count(count))));
@@ -583,7 +602,7 @@ impl App {
         let stacked = wide < STACK_BELOW;
         let paging = profile.paging.clone();
         let summary = join(&[
-            profile.kind.label(),
+            profile.kind,
             &profile
                 .subscribers
                 .map(|count| format!("{} subscribers", short_count(count)))
@@ -591,6 +610,10 @@ impl App {
             &profile
                 .video_count
                 .map(|count| format!("{} videos", short_count(count)))
+                .unwrap_or_default(),
+            &profile
+                .gallery_count
+                .map(|count| format!("{} galleries", short_count(count)))
                 .unwrap_or_default(),
         ]);
         let heading = if profile.verified {
@@ -691,7 +714,15 @@ impl App {
         if self.query.is_empty() && editing {
             spans.push(Span::styled(
                 fit(
-                    &format!("search {} or paste a link…", self.site.label()),
+                    &if self.site.scopes().len() > 1 {
+                        format!(
+                            "search {} {} or paste a link…",
+                            self.site.label(),
+                            self.scope.label()
+                        )
+                    } else {
+                        format!("search {} or paste a link…", self.site.label())
+                    },
                     room,
                 ),
                 soft,
@@ -847,11 +878,19 @@ impl App {
         lines
     }
 
+    fn gallery_selected(&self) -> bool {
+        self.visible()
+            .get(self.choice)
+            .is_some_and(|stream| stream.is_gallery())
+    }
+
     fn note(&self) -> Option<&'static str> {
         let streams = self.visible();
         let stream = streams.get(self.choice)?;
         Some(match stream.kind {
+            Kind::Audio if stream.extract => "audio cut out of the clip, which is fetched whole",
             Kind::Audio => "audio only",
+            Kind::Gallery => "every photo, saved into one folder",
             Kind::Muxed => "video and audio in one file",
             Kind::Video => {
                 let paired = self
@@ -860,7 +899,7 @@ impl App {
                     .and_then(|sources| sources.audio_for(stream))
                     .is_some();
                 if paired {
-                    "video and audio merged by snag"
+                    "video and audio merged by nab"
                 } else {
                     "video only, no matching audio"
                 }
@@ -1054,7 +1093,7 @@ impl App {
             y,
             wide,
             Line::from(vec![
-                Span::styled("✓ snagged! ", theme.bold()),
+                Span::styled("✓ nabbed! ", theme.bold()),
                 Span::styled("find your file in:", theme.text()),
             ]),
         );
@@ -1206,11 +1245,11 @@ mod tests {
         app.query.clear();
         app.caret = 0;
         let screen = draw(&mut app, 90, 30);
-        assert!(screen.contains("█▀▀ █▀▄█ █▀█ █▀▀▀"));
+        assert!(screen.contains("█▄ █ ▄▀▀▄ █▀▀▄"));
         assert!(screen.contains("╭─ Search or paste a link"));
         assert!(screen.contains("search youtube or paste a link…"));
-        assert!(screen.contains("▄▄▄▄▄▄▄▄") && screen.contains("▀▀▀▀▀▀▀▀"));
-        assert!(screen.lines().any(|line| line.ends_with("  snag")));
+        assert!(screen.contains("▄▄▄▄▄▄▄") && screen.contains("▀▀▀▀▀▀▀"));
+        assert!(screen.lines().any(|line| line.ends_with("  nab")));
         assert!(screen.contains("↵ search"));
         assert!(screen.contains("^t theme:auto"));
     }
@@ -1270,9 +1309,9 @@ mod tests {
         app.mode = Mode::Query;
         app.query.clear();
         app.caret = 0;
-        app.site = crate::site::Site::XHamster;
+        app.site = crate::sites::Site::named("xhamster").unwrap();
         let screen = draw(&mut app, 90, 30);
-        assert!(screen.contains("search xhamster or paste a link…"));
+        assert!(screen.contains("search xhamster videos or paste a link…"));
         assert!(screen.contains("^s site:xhamster"));
     }
 
@@ -1341,7 +1380,7 @@ mod tests {
         let audio = screen.find("♪ 128k").unwrap();
         assert!(video < muxed && muxed < audio);
         assert!(screen.contains("~19.1 MB") || screen.contains("~20.0 MB"));
-        assert!(screen.contains("video and audio merged by snag"));
+        assert!(screen.contains("video and audio merged by nab"));
         assert!(screen.contains("↵ download"));
         assert!(screen.contains("m mpv"));
         assert!(screen.contains("v vlc"));
@@ -1430,8 +1469,8 @@ mod tests {
         app.mode = Mode::Done;
         app.saved = Some(PathBuf::from("/tmp/out/A title.mp4"));
         let screen = draw(&mut app, 90, 30);
-        assert!(screen.contains("✓ snagged! find your file in:"));
-        assert!(screen.contains("↵ snag another"));
+        assert!(screen.contains("✓ nabbed! find your file in:"));
+        assert!(screen.contains("↵ nab another"));
         assert!(screen.contains("p play"));
     }
 

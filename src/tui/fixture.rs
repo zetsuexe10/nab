@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
 use super::app::{App, Mode};
+use crate::layout::Layout;
+use crate::model::Video;
 use crate::play::Player;
-use crate::search::Video;
-use crate::site::Suggestion;
-use crate::source::{Kind, Sources, Stream, INNERTUBE, YTULTRA};
+use crate::sites::youtube::{INNERTUBE, YTULTRA};
+use crate::sites::Suggestion;
+use crate::source::{Kind, Sources, Stream};
 
 pub fn video(index: usize) -> Video {
     let mut video = Video::stub(&format!("id{index:09}"));
@@ -30,13 +32,15 @@ pub fn stream(provider: &'static str, kind: Kind, quality: &str, ext: &str, size
         size,
         url: format!("https://x/{provider}/{quality}/{ext}"),
         height: quality.trim_end_matches(['p', 'k']).parse().unwrap_or(0),
+        referer: None,
+        extract: false,
     }
 }
 
 pub fn app() -> App {
     let mut app = App::new(
         "lofi".to_string(),
-        PathBuf::from("/tmp/out"),
+        Layout::new(PathBuf::from("/tmp/out")),
         Some(Player::Mpv),
     );
     app.animate = false;
@@ -62,7 +66,7 @@ pub fn app() -> App {
 
 pub fn profiled() -> App {
     let mut app = app();
-    app.profile = Some(crate::xh::sample_profile());
+    app.profile = Some(crate::sites::xhamster::sample_profile());
     app.mode = Mode::Profile;
     app
 }

@@ -1,18 +1,17 @@
 mod download;
 mod hls;
 mod hlsdl;
-mod innertube;
+mod layout;
+mod model;
 pub mod mux;
+mod photos;
 mod play;
-mod search;
-mod site;
+mod sites;
 mod source;
 #[cfg(test)]
 mod testserver;
 mod tui;
 mod util;
-mod xh;
-mod ytultra;
 
 use std::env;
 use std::io::IsTerminal;
@@ -20,8 +19,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use download::Job;
-use search::Video;
-use site::{Entry, Site};
+use layout::Layout;
+use model::{Media, Scope, Video};
+use sites::{Entry, Site};
 
 struct Args {
     query: String,
@@ -34,6 +34,7 @@ struct Args {
     player: Option<String>,
     theme: Option<tui::ThemeMode>,
     site: Option<Site>,
+    galleries: bool,
     list: bool,
     help: bool,
     version: bool,
@@ -43,7 +44,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("snag: {error}");
+            eprintln!("nab: {error}");
             ExitCode::FAILURE
         }
     }
@@ -56,7 +57,7 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     if args.version {
-        println!("snag {}", env!("CARGO_PKG_VERSION"));
+        println!("nab {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
     if args.audio && args.video {
@@ -64,39 +65,46 @@ fn run() -> Result<ExitCode, String> {
     }
     let plain = !args.audio && !args.video && !args.play && !args.list && args.quality.is_none();
     let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let out_dir = args.out.clone().unwrap_or_else(default_dir);
+    let layout = Layout::new(args.out.clone().unwrap_or_else(layout::default_root));
     if plain && terminal {
         let player = match args.player.as_deref() {
             Some(name) => Some(play::choose(Some(name))?),
             None => play::detect(),
         };
-        return tui::run(args.query, out_dir, player, args.theme, args.site)
+        return tui::run(args.query, layout, player, args.theme, args.site)
             .map(|_| ExitCode::SUCCESS);
     }
     if args.query.trim().is_empty() {
         print_help();
         return Ok(ExitCode::FAILURE);
     }
-    let mut site = args.site.unwrap_or(Site::YouTube);
+    let mut site = args.site.unwrap_or_else(Site::first);
+    let scope = if args.galleries {
+        Scope::Galleries
+    } else {
+        Scope::Videos
+    };
+    if !site.supports(scope) {
+        return Err(format!("{} has no galleries", site.title()));
+    }
+    if let Some(linked) = sites::link_site(&args.query) {
+        site = linked;
+    }
     let mut videos: Vec<Video>;
-    match site::classify(&args.query) {
+    match sites::classify(&args.query, site, scope) {
         Entry::Video(video) => videos = vec![video],
-        Entry::Profile(url) => {
-            let profile = site::profile(&url, "featured", 1)?;
-            videos = profile.videos;
+        Entry::Profile(owner, url) => {
+            videos = owner.profile(&url, "featured", scope, 1)?.videos;
         }
-        Entry::Search(query) => {
-            if query != args.query.trim() {
-                site = Site::XHamster;
-            }
-            let page = site::search(site, &query)?;
+        Entry::Search(query, scope) => {
+            let page = site.search(&query, scope)?;
             videos = page.videos;
             let mut cursor = page.cursor;
             while videos.len() < args.limit {
                 let Some(next) = cursor.take() else {
                     break;
                 };
-                let page = site::more(&next)?;
+                let page = sites::more(&next)?;
                 if page.videos.is_empty() {
                     break;
                 }
@@ -114,16 +122,38 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     let target = &videos[0];
-    let sources = site::resolve(target)?;
+    let sources = sites::resolve(target)?;
     let title = sources
         .title
         .clone()
         .filter(|title| !title.is_empty())
         .unwrap_or_else(|| target.title.clone());
+    let owner = Site::named(target.site).unwrap_or(site);
     let max_height = args
         .quality
         .as_deref()
         .and_then(|quality| quality.trim_end_matches('p').parse::<u32>().ok());
+    if target.media == Media::Gallery {
+        if args.play {
+            return Err("galleries are saved, not played".to_string());
+        }
+        if args.audio {
+            return Err("galleries have no audio".to_string());
+        }
+        let stream = sources
+            .gallery()
+            .ok_or_else(|| "no photos found".to_string())?;
+        let job = Job::Gallery {
+            photos: sources.photos.clone(),
+            referer: stream.referer.map(str::to_string),
+            title,
+            id: target.id.clone(),
+        };
+        let dir = layout.dir(owner.folder(), job.folder());
+        let path = download::run_blocking(job, dir)?;
+        println!("{}", path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
     if args.play {
         let player = play::choose(args.player.as_deref())?;
         if args.video || max_height.is_some() {
@@ -160,7 +190,8 @@ fn run() -> Result<ExitCode, String> {
             id: target.id.clone(),
         }
     };
-    let path = download::run_blocking(job, out_dir)?;
+    let dir = layout.dir(owner.folder(), job.folder());
+    let path = download::run_blocking(job, dir)?;
     println!("{}", path.display());
     Ok(ExitCode::SUCCESS)
 }
@@ -177,6 +208,7 @@ fn parse_args() -> Result<Args, String> {
         player: None,
         theme: None,
         site: None,
+        galleries: false,
         list: false,
         help: false,
         version: false,
@@ -191,6 +223,7 @@ fn parse_args() -> Result<Args, String> {
             "-v" | "--video" => args.video = true,
             "-p" | "--play" => args.play = true,
             "-l" | "--list" => args.list = true,
+            "-g" | "--galleries" => args.galleries = true,
             "-q" | "--quality" => {
                 let value = iter
                     .next()
@@ -221,10 +254,9 @@ fn parse_args() -> Result<Args, String> {
             "--site" => {
                 let value = iter
                     .next()
-                    .ok_or_else(|| "--site needs youtube or xhamster".to_string())?;
+                    .ok_or_else(|| format!("--site needs {}", Site::names()))?;
                 args.site = Some(
-                    Site::parse(&value)
-                        .ok_or_else(|| "--site needs youtube or xhamster".to_string())?,
+                    Site::parse(&value).ok_or_else(|| format!("--site needs {}", Site::names()))?,
                 );
             }
             "--theme" => {
@@ -272,59 +304,42 @@ fn print_results(videos: &[Video]) {
     }
 }
 
-fn default_dir() -> PathBuf {
-    if let Ok(dir) = env::var("XDG_DOWNLOAD_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    if let Some(home) = env::var_os("HOME") {
-        let downloads = PathBuf::from(&home).join("Downloads");
-        if downloads.is_dir() {
-            return downloads;
-        }
-        return PathBuf::from(home);
-    }
-    PathBuf::from(".")
-}
-
 fn print_help() {
     let version = env!("CARGO_PKG_VERSION");
+    let sites = Site::names();
     println!(
-        "snag {version}
-search youtube or xhamster, then snag the audio or video
+        "nab {version}
+search {sites}, then nab the audio, video or photo gallery
 
 usage:
-  snag <query>                        open the picker
-  snag --audio <query>                save audio of the top result
-  snag --video <query>                save video of the top result
-  snag --video --quality 480p <query> pick a height
-  snag --play [--video] <query>       play with mpv or vlc
-  snag --list <query>                 print results
-  snag --site xhamster <query>        search xhamster instead of youtube
-  snag <xhamster link>                video, profile or search links work too
+  nab <query>                        open the picker
+  nab <link>                         video, gallery or profile links work too
+  nab --audio <query>                save audio of the top result
+  nab --video <query>                save video of the top result
+  nab --video --quality 480p <query> pick a height
+  nab --play [--video] <query>       play with mpv or vlc
+  nab --list <query>                 print results
+  nab --site xhamster <query>        search another site
+  nab --galleries <query>            search photo galleries, where a site has them
 
 options:
   -a, --audio             save audio
-  -v, --video             save video
+  -v, --video             save video (a gallery's photos too)
   -q, --quality <height>  144p, 240p, 360p, 480p, 720p
   -p, --play              play instead of saving
-  -o, --out <dir>         output directory
-  -n, --limit <count>     search results to show (default 20)
+  -g, --galleries         search galleries instead of videos
+  -o, --out <dir>         output folder, default Downloads/Nab
+      --site <name>       {sites} (ctrl-s switches in the picker)
       --player <name>     mpv or vlc, default whatever is installed
-      --site <name>       youtube or xhamster (ctrl-s switches in the picker)
       --theme <mode>      auto, light or dark (ctrl-t cycles in the picker)
+  -n, --limit <count>     search results to show (default 20)
   -l, --list              print results and exit
   -h, --help              show this help
   -V, --version           show the version
 
-files land in $XDG_DOWNLOAD_DIR, ~/Downloads or $HOME.
-video and audio are merged by snag itself; playback needs mpv or vlc.
-youtube streams come straight from youtube with ytultra alongside; xhamster
-streams come from the page's initials data and from the page source. in the
-picker press tab to switch which provider's sources you are looking at.
-the picker suggests searches as you type, opens creator, channel and pornstar
-profiles, takes mouse clicks, remembers searches (up arrow) and offers a link
-from your clipboard (tab)."
+files are sorted into <out>/<Site>/<Videos|Audios|Galleries>, for example
+Downloads/Nab/Youtube/Videos. video and audio are merged by nab itself;
+playback needs mpv or vlc. in the picker tab switches a video's sources,
+ctrl-g flips between videos and galleries, and profiles open from results."
     );
 }

@@ -342,6 +342,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nab"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "unicode-width 0.2.0",
+ "ureq",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,17 +611,6 @@ name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
-
-[[package]]
-name = "snag"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ratatui",
- "serde_json",
- "unicode-width 0.2.0",
- "ureq",
-]
 
 [[package]]
 name = "static_assertions"

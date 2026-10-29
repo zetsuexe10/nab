@@ -252,7 +252,7 @@ fn play_merged(
     audio: &Remote,
     title: &str,
 ) -> Result<(), Fallback> {
-    let dir = std::env::temp_dir().join(format!("snag-play-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("nab-play-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let cleanup = Cleanup(dir.clone());
     let job = Job::Video {
@@ -363,7 +363,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mpv_receives_both_stream_urls() {
-        let dir = std::env::temp_dir().join(format!("snag-fake-mpv-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-fake-mpv-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (script, log, _) = fake_player(&dir, "mpv");
@@ -371,11 +371,13 @@ mod tests {
             url: "https://v.example/video".to_string(),
             ext: "mp4".to_string(),
             referer: None,
+            extract: false,
         };
         let audio = Remote {
             url: "https://a.example/audio".to_string(),
             ext: "m4a".to_string(),
             referer: None,
+            extract: false,
         };
         play_streams(&script, Some(&video), Some(&audio), "Clip", Player::Mpv).unwrap();
         let seen = fs::read_to_string(&log).unwrap();
@@ -386,8 +388,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn vlc_plays_a_file_merged_by_snag() {
-        let dir = std::env::temp_dir().join(format!("snag-fake-vlc-{}", std::process::id()));
+    fn vlc_plays_a_file_merged_by_nab() {
+        let dir = std::env::temp_dir().join(format!("nab-fake-vlc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let (script, log, copy) = fake_player(&dir, "vlc");
@@ -407,25 +409,27 @@ mod tests {
             url: format!("{base}/v.mp4"),
             ext: "mp4".to_string(),
             referer: None,
+            extract: false,
         };
         let audio = Remote {
             url: format!("{base}/a.m4a"),
             ext: "m4a".to_string(),
             referer: None,
+            extract: false,
         };
         play_streams(&script, Some(&video), Some(&audio), "Clip", Player::Vlc).unwrap();
         let seen = fs::read_to_string(&log).unwrap();
         assert!(seen.starts_with("--play-and-exit"));
         assert!(!seen.contains("input-slave"));
         assert_eq!(crate::mux::track_counts(&copy).unwrap(), (6, 6));
-        let leftovers = std::env::temp_dir().join(format!("snag-play-{}", std::process::id()));
+        let leftovers = std::env::temp_dir().join(format!("nab-play-{}", std::process::id()));
         assert!(!leftovers.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn finds_players_in_listed_places() {
-        let dir = std::env::temp_dir().join(format!("snag-locate-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-locate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         assert!(locate_in(Player::Vlc, std::slice::from_ref(&dir), &[]).is_none());

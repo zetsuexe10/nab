@@ -75,6 +75,13 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Result<(), String> {
     }
 }
 
+pub fn extract_audio(source: &Path, out: &Path) -> Result<(), String> {
+    match sniff(source)? {
+        Container::Mp4 => mp4::extract_audio(source, out),
+        Container::WebM => Err("audio extraction needs an mp4 stream".to_string()),
+    }
+}
+
 #[cfg(test)]
 pub fn track_counts(path: &Path) -> Result<(usize, usize), String> {
     match sniff(path)? {

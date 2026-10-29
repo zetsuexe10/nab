@@ -1029,10 +1029,20 @@ fn build_ftyp(parts: &[Part]) -> Vec<u8> {
 }
 
 pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
-    let mut parts = vec![
-        demux(video)?.into_part(b"vide")?,
-        demux(audio)?.into_part(b"soun")?,
-    ];
+    write(
+        vec![
+            demux(video)?.into_part(b"vide")?,
+            demux(audio)?.into_part(b"soun")?,
+        ],
+        out,
+    )
+}
+
+pub fn extract_audio(source: &Path, out: &Path) -> Res<()> {
+    write(vec![demux(source)?.into_part(b"soun")?], out)
+}
+
+fn write(mut parts: Vec<Part>, out: &Path) -> Res<()> {
     let (chunks, total) = plan(&parts);
     let wide = total > 0xffff_ffff - (64 << 20);
     let now = SystemTime::now()

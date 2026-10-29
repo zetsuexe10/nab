@@ -11,11 +11,11 @@ use super::clip;
 use super::store::Store;
 use super::theme::ThemeMode;
 use crate::download::{self, Job, Msg, Remote, Stage};
+use crate::layout::{Folder, Layout};
+use crate::model::{Profile, Scope, Video};
 use crate::play::{self, Player};
-use crate::search::Video;
-use crate::site::{self, Cursor, Entry, Page, Site, Suggestion};
-use crate::source::{self, Kind, Sources, Stream};
-use crate::xh;
+use crate::sites::{self, Cursor, Entry, Page, Site, Suggestion};
+use crate::source::{Kind, Sources, Stream};
 
 const NOTICE_FOR: Duration = Duration::from_secs(5);
 const PAGE: isize = 8;
@@ -69,20 +69,22 @@ enum Work {
     First(Result<Page, String>),
     More(Result<Page, String>),
     Resolved(Video, Result<Sources, String>),
-    Profiled(Result<xh::Profile, String>),
-    Suggested(Site, String, Vec<Suggestion>),
+    Profiled(Result<Profile, String>),
+    Suggested(Site, Scope, String, Vec<Suggestion>),
     Clipboard(Option<String>),
 }
 
 pub struct App {
     pub site: Site,
+    pub scope: Scope,
     pub query: String,
     pub caret: usize,
     pub suggestions: Vec<Suggestion>,
     pub suggest_sel: Option<usize>,
     suggest_for: String,
     typed_at: Option<Instant>,
-    pub profile: Option<xh::Profile>,
+    pub profile: Option<Profile>,
+    profile_site: Site,
     pub psel: usize,
     pub pscroll: usize,
     profile_from: Mode,
@@ -114,9 +116,10 @@ pub struct App {
     pub picked: String,
     pub saved: Option<PathBuf>,
     pub saved_video: bool,
+    pub saved_gallery: bool,
     pub error: String,
     pub notice: Option<(String, Instant)>,
-    pub out_dir: PathBuf,
+    pub layout: Layout,
     pub theme: ThemeMode,
     pub history: Vec<String>,
     pub recall: Option<usize>,
@@ -134,7 +137,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(query: String, out_dir: PathBuf, player: Option<Player>) -> Self {
+    pub fn new(query: String, layout: Layout, player: Option<Player>) -> Self {
         let (work_tx, work_rx) = mpsc::channel();
         let players: Vec<Player> = [Player::Mpv, Player::Vlc]
             .into_iter()
@@ -142,7 +145,8 @@ impl App {
             .collect();
         let caret = query.chars().count();
         App {
-            site: Site::YouTube,
+            site: Site::first(),
+            scope: Scope::Videos,
             query,
             caret,
             suggestions: Vec::new(),
@@ -150,6 +154,7 @@ impl App {
             suggest_for: String::new(),
             typed_at: None,
             profile: None,
+            profile_site: Site::first(),
             psel: 0,
             pscroll: 0,
             profile_from: Mode::Query,
@@ -181,9 +186,10 @@ impl App {
             picked: String::new(),
             saved: None,
             saved_video: false,
+            saved_gallery: false,
             error: String::new(),
             notice: None,
-            out_dir,
+            layout,
             theme: ThemeMode::Auto,
             history: Vec::new(),
             recall: None,
@@ -292,7 +298,11 @@ impl App {
         let query = self.query.trim();
         if query.is_empty()
             || query.contains("://")
-            || !matches!(site::classify(query), Entry::Search(_))
+            || sites::link_site(query).is_some()
+            || !matches!(
+                sites::classify(query, self.site, self.scope),
+                Entry::Search(..)
+            )
         {
             self.suggestions.clear();
             self.suggest_for.clear();
@@ -318,10 +328,10 @@ impl App {
         }
         self.suggest_for = query.clone();
         let tx = self.work_tx.clone();
-        let site = self.site;
+        let (site, scope) = (self.site, self.scope);
         std::thread::spawn(move || {
-            let rows = site::suggest(site, &query);
-            let _ = tx.send((0, Work::Suggested(site, query, rows)));
+            let rows = site.suggest(&query, scope);
+            let _ = tx.send((0, Work::Suggested(site, scope, query, rows)));
         });
     }
 
@@ -334,14 +344,42 @@ impl App {
         if let Some(store) = &self.store {
             store.save_site(self.site);
         }
+        if !self.site.supports(self.scope) {
+            self.scope = Scope::Videos;
+        }
+        self.reset_suggestions();
         self.results.clear();
         self.cursor = None;
+        self.tell(format!("searching {}", self.site.title()));
+    }
+
+    fn switch_scope(&mut self) {
+        let next = self.site.next_scope(self.scope);
+        if next == self.scope {
+            self.tell(format!(
+                "{} only has {}",
+                self.site.title(),
+                self.scope.label()
+            ));
+            return;
+        }
+        self.scope = next;
+        self.reset_suggestions();
+        self.results.clear();
+        self.cursor = None;
+        self.tell(format!(
+            "searching {} {}",
+            self.site.title(),
+            self.scope.label()
+        ));
+    }
+
+    fn reset_suggestions(&mut self) {
         self.suggestions.clear();
         self.suggest_for.clear();
         self.suggest_sel = None;
         self.typed_at = None;
         self.edited();
-        self.tell(format!("searching {}", self.site.title()));
     }
 
     fn move_suggestion(&mut self, delta: isize) {
@@ -370,7 +408,7 @@ impl App {
         match row.profile {
             Some(url) => {
                 self.remember(&row.text);
-                self.open_profile(url, "featured", 1, Mode::Query);
+                self.open_profile(self.site, url, "featured", Scope::Videos, 1, Mode::Query);
             }
             None => self.submit(),
         }
@@ -411,13 +449,24 @@ impl App {
         self.suggestions.clear();
         self.suggest_sel = None;
         self.typed_at = None;
-        if xh::classify(&query).is_some() {
-            self.site = Site::XHamster;
+        if let Some(site) = sites::link_site(&query) {
+            self.site = site;
         }
-        match site::classify(&query) {
-            Entry::Video(video) => self.start_resolve(video, Mode::Query),
-            Entry::Profile(url) => self.open_profile(url, "featured", 1, Mode::Query),
-            Entry::Search(text) => self.start_search(text),
+        match sites::classify(&query, self.site, self.scope) {
+            Entry::Video(video) => {
+                if let Some(site) = Site::named(video.site) {
+                    self.site = site;
+                }
+                self.start_resolve(video, Mode::Query)
+            }
+            Entry::Profile(site, url) => {
+                self.site = site;
+                self.open_profile(site, url, "featured", Scope::Videos, 1, Mode::Query)
+            }
+            Entry::Search(text, scope) => {
+                self.scope = scope;
+                self.start_search(text)
+            }
         }
     }
 
@@ -432,8 +481,8 @@ impl App {
         self.loading_more = false;
         self.back = Mode::Query;
         self.busy("searching");
-        let site = self.site;
-        self.spawn(move || Work::First(site::search(site, &query)));
+        let (site, scope) = (self.site, self.scope);
+        self.spawn(move || Work::First(site.search(&query, scope)));
     }
 
     pub fn start_resolve(&mut self, video: Video, back: Mode) {
@@ -443,13 +492,22 @@ impl App {
         self.formats_from = back;
         self.busy("resolving streams");
         self.spawn(move || {
-            let result = site::resolve(&video);
+            let result = sites::resolve(&video);
             Work::Resolved(video, result)
         });
     }
 
-    pub fn open_profile(&mut self, url: String, sort: &str, page: u32, back: Mode) {
+    pub fn open_profile(
+        &mut self,
+        site: Site,
+        url: String,
+        sort: &str,
+        scope: Scope,
+        page: u32,
+        back: Mode,
+    ) {
         self.ticket += 1;
+        self.profile_site = site;
         self.loading_more = false;
         self.back = back;
         if back != Mode::Profile {
@@ -457,13 +515,18 @@ impl App {
         }
         self.busy("loading profile");
         let sort = sort.to_string();
-        self.spawn(move || Work::Profiled(site::profile(&url, &sort, page)));
+        self.spawn(move || Work::Profiled(site.profile(&url, &sort, scope, page)));
     }
 
     fn open_author(&mut self, video: Option<Video>, back: Mode) {
-        match video.and_then(|video| video.author_url) {
-            Some(url) => self.open_profile(url, "featured", 1, back),
-            None => self.tell("no profile for this video"),
+        let Some(video) = video else {
+            return;
+        };
+        match (video.author_url.clone(), Site::named(video.site)) {
+            (Some(url), Some(site)) => {
+                self.open_profile(site, url, "featured", Scope::Videos, 1, back)
+            }
+            _ => self.tell("no profile for this one"),
         }
     }
 
@@ -474,8 +537,12 @@ impl App {
                     self.clip = found;
                     continue;
                 }
-                Work::Suggested(site, query, rows) => {
-                    if site == self.site && query == self.query.trim() && self.mode == Mode::Query {
+                Work::Suggested(site, scope, query, rows) => {
+                    if site == self.site
+                        && scope == self.scope
+                        && query == self.query.trim()
+                        && self.mode == Mode::Query
+                    {
                         self.suggestions = rows.into_iter().take(SUGGEST_MAX).collect();
                         self.suggest_sel = None;
                     }
@@ -534,11 +601,7 @@ impl App {
         match result {
             Ok(sources) if sources.streams.is_empty() => self.fail("no downloadable streams", back),
             Ok(sources) => {
-                let providers = sources.providers();
-                self.provider = [source::INNERTUBE, xh::INITIALS]
-                    .into_iter()
-                    .find(|wanted| providers.contains(wanted))
-                    .or(providers.first().copied());
+                self.provider = sources.default_provider();
                 let mut video = video;
                 if let Some(detail) = &sources.detail {
                     enrich(&mut video, detail);
@@ -553,7 +616,7 @@ impl App {
         }
     }
 
-    fn apply_profile(&mut self, result: Result<xh::Profile, String>) {
+    fn apply_profile(&mut self, result: Result<Profile, String>) {
         let back = self.back;
         match result {
             Ok(profile) => {
@@ -577,7 +640,7 @@ impl App {
             return;
         }
         self.loading_more = true;
-        self.spawn(move || Work::More(site::more(&cursor)));
+        self.spawn(move || Work::More(sites::more(&cursor)));
     }
 
     pub fn providers(&self) -> Vec<&'static str> {
@@ -697,7 +760,9 @@ impl App {
                 Flow::Continue
             }
             Mode::Download => {
-                if key.code == KeyCode::Esc && self.stage != Stage::Merging {
+                if key.code == KeyCode::Esc
+                    && !matches!(self.stage, Stage::Merging | Stage::Extracting)
+                {
                     if let Some(cancel) = &self.cancel {
                         cancel.store(true, Ordering::Relaxed);
                     }
@@ -872,6 +937,7 @@ impl App {
             KeyCode::Char('a') if control => self.caret = 0,
             KeyCode::Char('e') if control => self.caret = self.len(),
             KeyCode::Char('s') if control => self.switch_site(),
+            KeyCode::Char('g') if control => self.switch_scope(),
             KeyCode::Char('u') if control => {
                 self.remove(0, self.caret);
                 self.caret = 0;
@@ -1037,6 +1103,10 @@ impl App {
         Flow::Continue
     }
 
+    pub fn profile_scopes(&self) -> usize {
+        self.profile_site.scopes().len()
+    }
+
     pub fn profile_videos(&self) -> usize {
         self.profile
             .as_ref()
@@ -1057,9 +1127,9 @@ impl App {
             return Vec::new();
         };
         if profile.sorts.is_empty() {
-            xh::SORT_SEGMENTS
+            ["featured", "added", "rated", "viewed", "commented"]
                 .iter()
-                .map(|(id, _)| (*id).to_string())
+                .map(|id| (*id).to_string())
                 .collect()
         } else {
             profile.sorts.iter().map(|sort| sort.id.clone()).collect()
@@ -1083,19 +1153,20 @@ impl App {
             return;
         };
         let (page, last) = (profile.paging.page, profile.paging.last);
-        let (url, sort) = (profile.url.clone(), profile.sort.clone());
+        let (url, sort, scope) = (profile.url.clone(), profile.sort.clone(), profile.scope);
+        let site = self.profile_site;
         if forward {
             if last != 0 && page >= last || profile.videos.is_empty() {
                 self.tell("last page");
                 return;
             }
-            self.open_profile(url, &sort, page + 1, Mode::Profile);
+            self.open_profile(site, url, &sort, scope, page + 1, Mode::Profile);
         } else {
             if page <= 1 {
                 self.tell("first page");
                 return;
             }
-            self.open_profile(url, &sort, page - 1, Mode::Profile);
+            self.open_profile(site, url, &sort, scope, page - 1, Mode::Profile);
         }
     }
 
@@ -1104,13 +1175,27 @@ impl App {
         let Some(profile) = &self.profile else {
             return;
         };
-        if ids.len() < 2 {
+        if ids.len() < 2 || profile.scope == Scope::Galleries {
             return;
         }
         let at = ids.iter().position(|id| *id == profile.sort).unwrap_or(0);
         let next = ids[(at + 1) % ids.len()].clone();
         let url = profile.url.clone();
-        self.open_profile(url, &next, 1, Mode::Profile);
+        let site = self.profile_site;
+        self.open_profile(site, url, &next, Scope::Videos, 1, Mode::Profile);
+    }
+
+    fn cycle_profile_scope(&mut self) {
+        let Some(profile) = &self.profile else {
+            return;
+        };
+        let next = self.profile_site.next_scope(profile.scope);
+        if next == profile.scope {
+            return;
+        }
+        let url = profile.url.clone();
+        let site = self.profile_site;
+        self.open_profile(site, url, "featured", next, 1, Mode::Profile);
     }
 
     fn leave_profile(&mut self) {
@@ -1147,6 +1232,7 @@ impl App {
             KeyCode::Right | KeyCode::Char('n') | KeyCode::Char(']') => self.turn_page(true),
             KeyCode::Left | KeyCode::Char('p') | KeyCode::Char('[') => self.turn_page(false),
             KeyCode::Char('s') => self.cycle_sort(),
+            KeyCode::Char('t') => self.cycle_profile_scope(),
             KeyCode::Char('/') => {
                 self.caret = self.len();
                 self.mode = Mode::Query;
@@ -1177,6 +1263,10 @@ impl App {
         let Some(path) = self.saved.clone() else {
             return Flow::Continue;
         };
+        if self.saved_gallery {
+            self.tell("galleries are folders of photos, open them in your file manager");
+            return Flow::Continue;
+        }
         match self.pick(wanted) {
             Some(player) => Flow::PlayFile {
                 path,
@@ -1205,6 +1295,21 @@ impl App {
             .map(|video| video.id.clone())
             .unwrap_or_default();
         let pair = sources.audio_for(&stream).map(Stream::remote);
+        if stream.is_gallery() {
+            if !save {
+                self.tell("galleries are saved, not played");
+                return Flow::Continue;
+            }
+            let job = Job::Gallery {
+                photos: sources.photos.clone(),
+                referer: stream.referer.map(str::to_string),
+                title,
+                id,
+            };
+            self.picked = stream.quality.clone();
+            self.start_job(job, false);
+            return Flow::Continue;
+        }
         if save {
             let job = match stream.kind {
                 Kind::Audio => Job::Audio {
@@ -1218,6 +1323,7 @@ impl App {
                     title,
                     id,
                 },
+                Kind::Gallery => return Flow::Continue,
             };
             self.picked = if stream.is_audio() {
                 format!("audio {} {}", stream.quality, stream.ext)
@@ -1237,7 +1343,7 @@ impl App {
                 title,
                 player,
             },
-            Kind::Muxed | Kind::Video => Flow::Play {
+            Kind::Muxed | Kind::Video | Kind::Gallery => Flow::Play {
                 video: Some(stream.remote()),
                 audio: pair,
                 title,
@@ -1246,7 +1352,16 @@ impl App {
         }
     }
 
+    fn site_folder(&self) -> &'static str {
+        self.current
+            .as_ref()
+            .and_then(|video| Site::named(video.site))
+            .unwrap_or(self.site)
+            .folder()
+    }
+
     fn start_job(&mut self, job: Job, video: bool) {
+        let job_folder = job.folder();
         self.steps = match &job {
             Job::Video {
                 video: clip,
@@ -1254,6 +1369,9 @@ impl App {
                 ..
             } if crate::mux::pairs(&clip.ext, &audio.ext) => {
                 vec![Stage::Fetching, Stage::FetchingAudio, Stage::Merging]
+            }
+            Job::Audio { audio, .. } if audio.extract => {
+                vec![Stage::Fetching, Stage::Extracting]
             }
             _ => vec![Stage::Fetching],
         };
@@ -1268,8 +1386,9 @@ impl App {
         self.started = Instant::now();
         self.phase_started = Instant::now();
         self.saved_video = video;
+        self.saved_gallery = matches!(job_folder, Folder::Galleries);
         self.mode = Mode::Download;
-        let dir = self.out_dir.clone();
+        let dir = self.layout.dir(self.site_folder(), job_folder);
         std::thread::spawn(move || download::run(job, dir, tx, cancel));
     }
 
@@ -1452,12 +1571,12 @@ mod tests {
     fn control_s_switches_site_and_drops_old_results() {
         let mut app = sample();
         app.mode = Mode::Query;
-        assert_eq!(app.site, Site::YouTube);
+        assert_eq!(app.site, Site::first());
         control(&mut app, 's');
-        assert_eq!(app.site, Site::XHamster);
+        assert_eq!(app.site, Site::named("xhamster").unwrap());
         assert!(app.results.is_empty());
         control(&mut app, 's');
-        assert_eq!(app.site, Site::YouTube);
+        assert_eq!(app.site, Site::first());
     }
 
     #[test]
@@ -1465,7 +1584,7 @@ mod tests {
         let mut app = sample();
         empty_query(&mut app);
         app.on_paste("https://xhamster.com/creators/sample".to_string());
-        assert_eq!(app.site, Site::XHamster);
+        assert_eq!(app.site, Site::named("xhamster").unwrap());
         assert_eq!(app.mode, Mode::Busy);
         assert_eq!(app.busy, "loading profile");
     }
@@ -1626,7 +1745,7 @@ mod tests {
             .collect();
         assert_eq!(order, vec!["720p", "360p", "128k"]);
         press(&mut app, KeyCode::Tab);
-        assert_eq!(app.provider, Some(source::YTULTRA));
+        assert_eq!(app.provider, Some(crate::sites::youtube::YTULTRA));
         assert_eq!(app.visible().len(), 1);
         press(&mut app, KeyCode::Tab);
         assert_eq!(app.visible().len(), 3);
@@ -1704,9 +1823,9 @@ mod tests {
 
     #[test]
     fn enter_downloads_and_plans_the_merge_steps() {
-        let dir = std::env::temp_dir().join(format!("snag-ui-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-ui-{}", std::process::id()));
         let mut app = sample();
-        app.out_dir = dir.clone();
+        app.layout = Layout::new(dir.clone());
         app.mode = Mode::Formats;
         app.choice = 0;
         press(&mut app, KeyCode::Enter);
@@ -1722,7 +1841,7 @@ mod tests {
     }
 
     #[test]
-    fn done_snags_another_or_plays_the_file() {
+    fn done_nabs_another_or_plays_the_file() {
         let mut app = sample();
         app.mode = Mode::Done;
         app.saved = Some(PathBuf::from("/tmp/x.mp4"));
@@ -1871,5 +1990,23 @@ mod tests {
         app.mode = Mode::Formats;
         wheel(&mut app, MouseEventKind::ScrollDown);
         assert_eq!(app.choice, 1);
+    }
+
+    #[test]
+    fn ctrl_g_switches_scope_only_where_a_site_has_galleries() {
+        let mut app = sample();
+        app.mode = Mode::Query;
+        control(&mut app, 'g');
+        assert_eq!(app.scope, Scope::Videos);
+        control(&mut app, 's');
+        assert_eq!(app.site, Site::named("xhamster").unwrap());
+        control(&mut app, 'g');
+        assert_eq!(app.scope, Scope::Galleries);
+        control(&mut app, 'g');
+        assert_eq!(app.scope, Scope::Videos);
+        control(&mut app, 'g');
+        control(&mut app, 's');
+        assert_eq!(app.site, Site::first());
+        assert_eq!(app.scope, Scope::Videos);
     }
 }

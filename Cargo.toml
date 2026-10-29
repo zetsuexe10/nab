@@ -1,8 +1,8 @@
 [package]
-name = "snag"
+name = "nab"
 version = "0.1.0"
 edition = "2021"
-description = "Search YouTube and snag the audio or video"
+description = "Search YouTube and xHamster, then nab the video, audio or photo gallery"
 license = "MIT"
 readme = "README.md"
 exclude = [".github", "install.sh"]

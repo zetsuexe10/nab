@@ -541,8 +541,8 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
         .fold(0.0, f64::max);
     let mut info = uint_element(TIMECODE_SCALE, 1_000_000);
     info.extend_from_slice(&float_element(DURATION, source_ms.max(last as f64)));
-    info.extend_from_slice(&element(MUXING_APP, b"snag"));
-    info.extend_from_slice(&element(WRITING_APP, b"snag"));
+    info.extend_from_slice(&element(MUXING_APP, b"nab"));
+    info.extend_from_slice(&element(WRITING_APP, b"nab"));
     let info = element(INFO, &info);
     let mut tracks = Vec::new();
     for (index, part) in parts.iter().enumerate() {

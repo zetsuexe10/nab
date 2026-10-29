@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::hlsdl;
+use crate::layout::Folder;
+use crate::model::Photo;
 use crate::mux;
+use crate::photos;
 use crate::util::{human_size, sanitize_filename};
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
@@ -19,6 +22,7 @@ pub struct Remote {
     pub url: String,
     pub ext: String,
     pub referer: Option<String>,
+    pub extract: bool,
 }
 
 pub enum Job {
@@ -33,12 +37,29 @@ pub enum Job {
         title: String,
         id: String,
     },
+    Gallery {
+        photos: Vec<Photo>,
+        referer: Option<String>,
+        title: String,
+        id: String,
+    },
+}
+
+impl Job {
+    pub fn folder(&self) -> Folder {
+        match self {
+            Job::Audio { .. } => Folder::Audios,
+            Job::Video { .. } => Folder::Videos,
+            Job::Gallery { .. } => Folder::Galleries,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
     Fetching,
     FetchingAudio,
+    Extracting,
     Merging,
 }
 
@@ -47,6 +68,7 @@ impl Stage {
         match self {
             Stage::Fetching => "downloading",
             Stage::FetchingAudio => "downloading audio",
+            Stage::Extracting => "extracting audio",
             Stage::Merging => "merging audio and video",
         }
     }
@@ -127,14 +149,55 @@ fn execute(
     match job {
         Job::Audio { audio, title, id } => {
             let stem = stem(title, id);
-            let dest = unique_path(dir, &stem, &audio.ext, id);
-            let part = dir.join(format!(".snag-{id}-{pid}.audio"));
-            let _temps = Temps(vec![part.clone()]);
+            let part = dir.join(format!(".nab-{id}-{pid}.audio"));
+            let cut = dir.join(format!(".nab-{id}-{pid}.cut"));
+            let scratch = dir.join(format!(".nab-{id}-{pid}.segments"));
+            let _temps = Temps(vec![part.clone(), cut.clone(), scratch.clone()]);
             let _ = tx.send(Msg::Stage(Stage::Fetching));
-            if !fetch(audio, &part, tx, cancel)? {
+            let Some(container) = fetch_any(audio, &part, &scratch, tx, cancel)? else {
                 return Ok(None);
+            };
+            if !audio.extract {
+                let dest = unique_path(dir, &stem, &audio.ext, id);
+                save(&part, &dest)?;
+                return Ok(Some(dest));
             }
-            save(&part, &dest)?;
+            if container != "mp4" {
+                return Err("audio can only be taken out of an mp4 stream".to_string());
+            }
+            let _ = tx.send(Msg::Stage(Stage::Extracting));
+            mux::extract_audio(&part, &cut)
+                .map_err(|error| format!("could not extract the audio: {error}"))?;
+            let dest = unique_path(dir, &stem, "m4a", id);
+            save(&cut, &dest)?;
+            Ok(Some(dest))
+        }
+        Job::Gallery {
+            photos: items,
+            referer,
+            title,
+            id,
+        } => {
+            let stem = stem(title, id);
+            let scratch = dir.join(format!(".nab-{id}-{pid}.gallery"));
+            let _temps = Temps(vec![scratch.clone()]);
+            let _ = tx.send(Msg::Stage(Stage::Fetching));
+            let Some(outcome) = photos::fetch(items, referer.as_deref(), &scratch, tx, cancel)?
+            else {
+                return Ok(None);
+            };
+            if outcome.saved == 0 {
+                return Err("no photo could be downloaded".to_string());
+            }
+            if outcome.failed > 0 {
+                let _ = tx.send(Msg::Note(format!(
+                    "{} of {} photos could not be downloaded",
+                    outcome.failed,
+                    outcome.saved + outcome.failed
+                )));
+            }
+            let dest = unique_dir(dir, &stem, id);
+            save(&scratch, &dest)?;
             Ok(Some(dest))
         }
         Job::Video {
@@ -144,28 +207,24 @@ fn execute(
             id,
         } => {
             let stem = stem(title, id);
-            let video_part = dir.join(format!(".snag-{id}-{pid}.video"));
-            let audio_part = dir.join(format!(".snag-{id}-{pid}.audio"));
-            let merged_part = dir.join(format!(".snag-{id}-{pid}.merged"));
+            let video_part = dir.join(format!(".nab-{id}-{pid}.video"));
+            let audio_part = dir.join(format!(".nab-{id}-{pid}.audio"));
+            let merged_part = dir.join(format!(".nab-{id}-{pid}.merged"));
             let _temps = Temps(vec![
                 video_part.clone(),
                 audio_part.clone(),
                 merged_part.clone(),
             ]);
             let _ = tx.send(Msg::Stage(Stage::Fetching));
+            let scratch = dir.join(format!(".nab-{id}-{pid}.segments"));
+            let _scratch = Temps(vec![scratch.clone()]);
+            let Some(container) = fetch_any(video, &video_part, &scratch, tx, cancel)? else {
+                return Ok(None);
+            };
             if video.ext == "m3u8" {
-                let scratch = dir.join(format!(".snag-{id}-{pid}.segments"));
-                let _scratch = Temps(vec![scratch.clone()]);
-                let Some(container) = hlsdl::fetch(video, &video_part, &scratch, tx, cancel)?
-                else {
-                    return Ok(None);
-                };
                 let dest = unique_path(dir, &stem, container, id);
                 save(&video_part, &dest)?;
                 return Ok(Some(dest));
-            }
-            if !fetch(video, &video_part, tx, cancel)? {
-                return Ok(None);
             }
             let pair = audio
                 .as_ref()
@@ -195,6 +254,22 @@ fn execute(
             Ok(Some(dest))
         }
     }
+}
+
+fn fetch_any(
+    remote: &Remote,
+    part: &Path,
+    scratch: &Path,
+    tx: &Sender<Msg>,
+    cancel: &AtomicBool,
+) -> Result<Option<&'static str>, String> {
+    if remote.ext == "m3u8" {
+        return hlsdl::fetch(remote, part, scratch, tx, cancel);
+    }
+    if !fetch(remote, part, tx, cancel)? {
+        return Ok(None);
+    }
+    Ok(Some(if remote.ext == "mp4" { "mp4" } else { "other" }))
 }
 
 fn with_referer<B>(
@@ -407,6 +482,24 @@ pub fn unique_path(dir: &Path, stem: &str, ext: &str, id: &str) -> PathBuf {
     dir.join(format!("{stem} [{id}] {}.{ext}", std::process::id()))
 }
 
+pub fn unique_dir(dir: &Path, stem: &str, id: &str) -> PathBuf {
+    let first = dir.join(stem);
+    if !first.exists() {
+        return first;
+    }
+    let second = dir.join(format!("{stem} [{id}]"));
+    if !second.exists() {
+        return second;
+    }
+    for number in 2..1000 {
+        let candidate = dir.join(format!("{stem} [{id}] {number}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem} [{id}] {}", std::process::id()))
+}
+
 struct Temps(Vec<PathBuf>);
 
 impl Drop for Temps {
@@ -425,7 +518,7 @@ mod tests {
 
     #[test]
     fn names_do_not_collide() {
-        let dir = std::env::temp_dir().join(format!("snag-paths-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-paths-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let first = unique_path(&dir, "clip", "m4a", "abcdefghijk");
@@ -441,7 +534,7 @@ mod tests {
 
     #[test]
     fn temp_parts_are_cleaned() {
-        let dir = std::env::temp_dir().join(format!("snag-temps-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-temps-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let part = dir.join("part");
@@ -488,7 +581,7 @@ mod tests {
     #[test]
     fn downloads_and_merges_in_process() {
         let (base, video, audio) = served();
-        let dir = std::env::temp_dir().join(format!("snag-e2e-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-e2e-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (tx, rx) = mpsc::channel();
         let job = Job::Video {
@@ -496,11 +589,13 @@ mod tests {
                 url: format!("{base}/v.mp4"),
                 ext: "mp4".to_string(),
                 referer: None,
+                extract: false,
             },
             audio: Some(Remote {
                 url: format!("{base}/a.m4a"),
                 ext: "m4a".to_string(),
                 referer: None,
+                extract: false,
             }),
             title: "My: clip".to_string(),
             id: "abcdefghijk".to_string(),
@@ -521,7 +616,7 @@ mod tests {
         let hidden: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".snag"))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".nab"))
             .collect();
         assert!(hidden.is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -530,7 +625,7 @@ mod tests {
     #[test]
     fn unpaired_audio_saves_video_with_a_note() {
         let (base, video, _) = served();
-        let dir = std::env::temp_dir().join(format!("snag-e2e-solo-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-e2e-solo-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (tx, rx) = mpsc::channel();
         let job = Job::Video {
@@ -538,11 +633,13 @@ mod tests {
                 url: format!("{base}/v.mp4"),
                 ext: "mp4".to_string(),
                 referer: None,
+                extract: false,
             },
             audio: Some(Remote {
                 url: format!("{base}/a.m4a"),
                 ext: "weba".to_string(),
                 referer: None,
+                extract: false,
             }),
             title: "solo".to_string(),
             id: "abcdefghijk".to_string(),
@@ -565,7 +662,7 @@ mod tests {
             ("/v.mp4".to_string(), vec![7u8; 5000]),
             ("/a.m4a".to_string(), vec![9u8; 5000]),
         ]);
-        let dir = std::env::temp_dir().join(format!("snag-e2e-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-e2e-bad-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let (tx, rx) = mpsc::channel();
         let job = Job::Video {
@@ -573,11 +670,13 @@ mod tests {
                 url: format!("{base}/v.mp4"),
                 ext: "mp4".to_string(),
                 referer: None,
+                extract: false,
             },
             audio: Some(Remote {
                 url: format!("{base}/a.m4a"),
                 ext: "m4a".to_string(),
                 referer: None,
+                extract: false,
             }),
             title: "bad".to_string(),
             id: "abcdefghijk".to_string(),
@@ -597,7 +696,7 @@ mod tests {
 
     #[test]
     fn reports_cancelled_before_connecting() {
-        let dir = std::env::temp_dir().join(format!("snag-cancel-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-cancel-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let (tx, _rx) = mpsc::channel();
         let cancel = AtomicBool::new(true);
@@ -607,6 +706,7 @@ mod tests {
                 url: "https://example.invalid/x".to_string(),
                 ext: "mp4".to_string(),
                 referer: None,
+                extract: false,
             },
             &dest,
             &tx,
@@ -624,6 +724,7 @@ mod tests {
                 url,
                 ext: "m3u8".to_string(),
                 referer: Some("https://example.test/".to_string()),
+                extract: false,
             },
             audio: None,
             title: "Stream: clip".to_string(),
@@ -632,7 +733,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("snag-hls-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-hls-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -723,6 +824,131 @@ mod tests {
             .map(|entries| entries.count())
             .unwrap_or(0);
         assert_eq!(left, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extracted_audio_lands_as_an_m4a_with_only_the_sound_track() {
+        let video = mux::synth::frames(true, 6, 1);
+        let audio = mux::synth::frames(false, 7, 2);
+        let mut both = std::env::temp_dir().join(format!("nab-xa-src-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&both);
+        fs::create_dir_all(&both).unwrap();
+        fs::write(
+            both.join("v.mp4"),
+            mux::synth::progressive(true, &video, 15360, 512),
+        )
+        .unwrap();
+        fs::write(
+            both.join("a.m4a"),
+            mux::synth::progressive(false, &audio, 44100, 1024),
+        )
+        .unwrap();
+        mux::merge(
+            &both.join("v.mp4"),
+            &both.join("a.m4a"),
+            &both.join("j.mp4"),
+        )
+        .unwrap();
+        let joined = fs::read(both.join("j.mp4")).unwrap();
+        let _ = fs::remove_dir_all(&both);
+        both = std::env::temp_dir().join(format!("nab-xa-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&both);
+        let base = crate::testserver::serve(vec![("/clip.mp4".to_string(), joined)]);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Audio {
+            audio: Remote {
+                url: format!("{base}/clip.mp4"),
+                ext: "mp4".to_string(),
+                referer: None,
+                extract: true,
+            },
+            title: "clip".to_string(),
+            id: "abcdefghijk".to_string(),
+        };
+        run(job, both.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (stages, _, done) = collect(rx);
+        let path = done.unwrap();
+        assert_eq!(stages, vec![Stage::Fetching, Stage::Extracting]);
+        assert_eq!(path.file_name().unwrap(), "clip.m4a");
+        let bytes = fs::read(&path).unwrap();
+        let has = |tag: &[u8]| bytes.windows(4).any(|window| window == tag);
+        assert!(has(b"soun") && !has(b"vide"));
+        assert!(mux::track_counts(&path).is_err());
+        let _ = fs::remove_dir_all(&both);
+    }
+
+    #[test]
+    fn galleries_save_every_photo_into_one_numbered_folder() {
+        let base = crate::testserver::serve(vec![
+            ("/a.jpg".to_string(), vec![1u8; 300]),
+            ("/b.png".to_string(), vec![2u8; 400]),
+            ("/c.webp".to_string(), vec![3u8; 500]),
+        ]);
+        let dir = std::env::temp_dir().join(format!("nab-gal-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let photos = ["a.jpg", "b.png", "c.webp", "missing.jpg"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| crate::model::Photo {
+                id: index.to_string(),
+                url: format!("{base}/{name}"),
+            })
+            .collect();
+        let job = Job::Gallery {
+            photos,
+            referer: None,
+            title: "Trip: day 1".to_string(),
+            id: "42".to_string(),
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (_, notes, done) = collect(rx);
+        let folder = done.unwrap();
+        assert!(folder.is_dir());
+        assert_eq!(folder.file_name().unwrap(), "Trip day 1");
+        let mut names: Vec<String> = fs::read_dir(&folder)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 3);
+        assert!(names[0].starts_with("001"));
+        assert!(names[2].starts_with("003"));
+        assert_eq!(notes.len(), 1);
+        let hidden = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".nab"))
+            .count();
+        assert_eq!(hidden, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_gallery_with_no_reachable_photo_is_an_error() {
+        let base = crate::testserver::serve(vec![]);
+        let dir = std::env::temp_dir().join(format!("nab-gal-none-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Gallery {
+            photos: vec![crate::model::Photo {
+                id: "1".to_string(),
+                url: format!("{base}/nope.jpg"),
+            }],
+            referer: None,
+            title: "none".to_string(),
+            id: "7".to_string(),
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let mut failed = false;
+        for message in rx {
+            if matches!(message, Msg::Failed(_)) {
+                failed = true;
+            }
+        }
+        assert!(failed);
         let _ = fs::remove_dir_all(&dir);
     }
 }

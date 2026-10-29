@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::theme::ThemeMode;
-use crate::site::Site;
+use crate::sites::Site;
 
 const LIMIT: usize = 50;
 
@@ -17,7 +17,7 @@ impl Store {
     }
 
     pub fn locate() -> Option<Store> {
-        if let Some(dir) = std::env::var_os("SNAG_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        if let Some(dir) = std::env::var_os("NAB_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
             return Some(Store::at(PathBuf::from(dir)));
         }
         let base = if cfg!(windows) {
@@ -30,7 +30,7 @@ impl Store {
                     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
                 })
         }?;
-        Some(Store::at(base.join("snag")))
+        Some(Store::at(base.join("nab")))
     }
 
     pub fn history(&self) -> Vec<String> {
@@ -92,7 +92,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("snag-store-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nab-store-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
@@ -135,8 +135,8 @@ mod tests {
         fs::write(dir.join("theme"), "purple").unwrap();
         assert_eq!(store.theme(), None);
         assert_eq!(store.site(), None);
-        store.save_site(Site::XHamster);
-        assert_eq!(store.site(), Some(Site::XHamster));
+        store.save_site(Site::named("xhamster").unwrap());
+        assert_eq!(store.site(), Some(Site::named("xhamster").unwrap()));
         fs::write(dir.join("history.json"), "{broken").unwrap();
         assert!(store.history().is_empty());
         let _ = fs::remove_dir_all(dir);

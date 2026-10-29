@@ -1,9 +1,9 @@
 /target
 /dist
 /artifacts
-.snag-*
+.nab-*
 ytx/
-youtube/
+/youtube/
 *.har
 wh.txt
 yt-ext.txt

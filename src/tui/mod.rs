@@ -9,7 +9,6 @@ pub use theme::ThemeMode;
 mod view;
 
 use std::io::{stdout, Stdout};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, Show};
@@ -24,8 +23,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use crate::layout::Layout;
 use crate::play::{self, Player};
-use crate::site::Site;
+use crate::sites::Site;
 use app::{App, Flow, Mode};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -150,14 +150,14 @@ fn event_loop(mut terminal: Term, mut app: App) -> Result<(), String> {
 
 pub fn run(
     query: String,
-    out_dir: PathBuf,
+    layout: Layout,
     player: Option<Player>,
     theme: Option<theme::ThemeMode>,
     site: Option<Site>,
 ) -> Result<(), String> {
     install_panic_hook();
     let terminal = setup()?;
-    let mut app = App::new(query, out_dir, player)
+    let mut app = App::new(query, layout, player)
         .with_store(store::Store::locate())
         .with_theme(theme)
         .with_site(site);

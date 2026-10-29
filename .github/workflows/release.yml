@@ -20,10 +20,6 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: i686-pc-windows-msvc
@@ -55,31 +51,31 @@ jobs:
       - name: smoke unix
         if: runner.os == 'Linux' && matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          ./target/${{ matrix.target }}/release/snag --version
-          ./target/${{ matrix.target }}/release/snag --help | head -4
+          ./target/${{ matrix.target }}/release/nab --version
+          ./target/${{ matrix.target }}/release/nab --help | head -4
       - name: smoke windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "target/${{ matrix.target }}/release/snag.exe" --version
-          & "target/${{ matrix.target }}/release/snag.exe" --help
+          & "target/${{ matrix.target }}/release/nab.exe" --version
+          & "target/${{ matrix.target }}/release/nab.exe" --help
       - name: package unix
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/snag dist/
-          tar -C dist -czf snag-${{ matrix.target }}.tar.gz snag
+          cp target/${{ matrix.target }}/release/nab dist/
+          tar -C dist -czf nab-${{ matrix.target }}.tar.gz nab
       - name: package windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/snag.exe" dist/
-          Compress-Archive -Path dist/snag.exe -DestinationPath "snag-${{ matrix.target }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/nab.exe" dist/
+          Compress-Archive -Path dist/nab.exe -DestinationPath "nab-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: snag-${{ matrix.target }}
-          path: snag-${{ matrix.target }}.*
+          name: nab-${{ matrix.target }}
+          path: nab-${{ matrix.target }}.*
           if-no-files-found: error
 
   publish:
