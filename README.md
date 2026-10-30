@@ -90,25 +90,31 @@ nab https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | search | `↑` `↓` | with no suggestions open, walk through earlier searches or jump to the results |
 | search | `tab` | fill the highlighted suggestion, paste the clipboard link, or jump to the results |
 | search | `ctrl+s` | switch between YouTube and xHamster |
-| search | `ctrl+g` | switch between videos and galleries, on sites that have both |
+| search | `ctrl+g` | switch what you search: videos, galleries, stars (where the site has them) |
 | search | `←` `→` `home` `end` | move the cursor |
 | search | `ctrl+u` `ctrl+w` `ctrl+k` | clear, delete word, delete to end |
 | search | `esc` | jump to the results (quits when there are none) |
 | results | `j` `k` `↑` `↓` | move; `pgup` `pgdn` jump; `g` `G` first and last |
 | results | `enter` | show the formats |
 | results | `o` | open the uploader's profile, when the site has one |
+| results | `c` / `r` | comments / related videos of the highlighted video (xHamster) |
+| results | `enter` on a star | open the star's profile |
 | results | `/` `esc` | edit the query |
 | profile | `j` `k` `↑` `↓` | move; `pgup` `pgdn` jump; `g` `G` first and last |
 | profile | `enter` | show the formats of the highlighted video |
 | profile | `←` `→` or `p` `n` | previous and next page |
 | profile | `t` | switch between the person's videos and galleries |
 | profile | `s` | cycle the sort: featured, newest, best, most viewed, most commented |
+| profile | `c` | comments of the highlighted video |
 | profile | `esc` | back to where you came from |
+| comments | `j` `k` `pgup` `pgdn` | move; more pages load as you near the end |
+| comments | `esc` | back |
 | formats | `enter` | download the highlighted format |
 | formats | `p` | play it with the current player (galleries are saved, not played) |
 | formats | `m` / `v` | play with mpv / vlc, and keep that choice |
 | formats | `tab` | switch source (innertube, ytultra, initials, page source) |
 | formats | `o` | open the uploader's profile |
+| formats | `c` / `r` | comments / related videos |
 | formats | `esc` | back |
 | download | `esc` | cancel (not while merging or extracting audio) |
 | done | `enter` | nab another |
@@ -253,6 +259,9 @@ instead, so one still works when the other breaks.
 - Requests carry an age-verified cookie and an xHamster referer; mpv and vlc get the same
   referer. Links locked to one IP are ranked below open ones.
 - Geo-blocked and removed videos are reported as such.
+- Uploader (`/users/…`) profiles read their videos from the `/videos` tab and page by number; the hero details come from the landing page.
+- Related videos use `/api/front/video/related` and page on as you scroll. Comments come from the site's `/x-api` call and load page by page.
+- Stars: `ctrl+g` to the stars scope lists the pornstar directory (type `creators`, `channels` or `celebrities` for the others) or searches stars by name; `enter` opens a profile.
 - xHamster has no audio-only stream, so `Audios` is filled by cutting the sound track
   out of the smallest progressive mp4 (the smallest HLS stream when there is none), with
   no re-encoding, as `.m4a`. The clip is fetched whole first; only mp4 sources can be cut.

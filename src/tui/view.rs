@@ -8,7 +8,7 @@ use super::app::{App, Hit, Mode, Zone, SUGGEST_MAX};
 use super::logo;
 use super::theme::{clock, fit, join, pad, tilde, width, wrap, Theme};
 use crate::download::Stage;
-use crate::model::{Scope, Video};
+use crate::model::{Media, Scope, Video};
 use crate::play::Player;
 use crate::sites::Suggestion;
 use crate::source::Kind;
@@ -209,6 +209,17 @@ impl App {
                 {
                     hints.push(hint("o", "profile"));
                 }
+                if self.results.get(self.sel).is_some_and(|video| {
+                    video.media == Media::Video
+                        && crate::sites::Site::named(video.site)
+                            .is_some_and(|site| site.has_comments())
+                }) {
+                    hints.push(hint("c", "comments"));
+                    hints.push(hint("r", "related"));
+                }
+                if !self.trail_empty() {
+                    hints.push(hint("esc", "back"));
+                }
                 hints.push(hint("/", "search"));
                 hints.push(hint("^c", "quit"));
             }
@@ -220,14 +231,22 @@ impl App {
                 if self
                     .profile
                     .as_ref()
-                    .is_some_and(|p| p.scope == Scope::Videos)
+                    .is_some_and(|p| p.scope == Scope::Videos && p.kind != "user")
                 {
                     hints.push(hint("s", format!("sort:{}", self.sort_label())));
                 }
                 if self.profile_scopes() > 1 {
                     hints.push(hint("t", "videos/galleries"));
                 }
+                if self.profile_videos() > 0 {
+                    hints.push(hint("c", "comments"));
+                }
                 hints.push(hint("esc", "back"));
+            }
+            Mode::Comments => {
+                hints.push(hint("↑↓", "move"));
+                hints.push(hint("esc", "back"));
+                hints.push(hint("^c", "quit"));
             }
             Mode::Formats => {
                 hints.push(hint("↵", "download"));
@@ -242,6 +261,14 @@ impl App {
                     .is_some_and(|video| video.author_url.is_some())
                 {
                     hints.push(hint("o", "profile"));
+                }
+                if self.current.as_ref().is_some_and(|video| {
+                    video.media == Media::Video
+                        && crate::sites::Site::named(video.site)
+                            .is_some_and(|site| site.has_comments())
+                }) {
+                    hints.push(hint("c", "comments"));
+                    hints.push(hint("r", "related"));
                 }
                 if self.providers().len() > 1 {
                     hints.push(hint("⇥", self.provider.unwrap_or("source")));
@@ -401,6 +428,7 @@ impl App {
                         .max(self.left_lines(wide).len() as u16)
                 }
             }
+            Mode::Comments => avail,
             Mode::Download => 5,
             Mode::Done => 6,
             Mode::Error => (wrap(&format!("✗ {}", self.error), wide as usize).len() as u16)
@@ -429,6 +457,7 @@ impl App {
             Mode::Profile => self.draw_profile(frame, theme, x, y, wide, tall),
             Mode::Results => self.draw_results(frame, theme, x, y, wide, tall),
             Mode::Formats => self.draw_formats(frame, theme, x, y, wide, tall),
+            Mode::Comments => self.draw_comments(frame, theme, x, y, wide, tall),
             Mode::Download => self.draw_download(frame, theme, x, y, wide),
             Mode::Done => self.draw_done(frame, theme, x, y, wide),
             Mode::Error => {
@@ -714,7 +743,12 @@ impl App {
         if self.query.is_empty() && editing {
             spans.push(Span::styled(
                 fit(
-                    &if self.site.scopes().len() > 1 {
+                    &if self.scope == Scope::Stars {
+                        format!(
+                            "{} stars: a name, or pornstars / creators / channels / celebrities",
+                            self.site.label()
+                        )
+                    } else if self.site.scopes().len() > 1 {
                         format!(
                             "search {} {} or paste a link…",
                             self.site.label(),
@@ -835,10 +869,15 @@ impl App {
             lines.push(first);
             lines.push(second);
         }
+        let name = match &self.related_of {
+            Some(title) => format!("Related to {title}"),
+            None if self.scope == Scope::Stars => "Stars".to_string(),
+            None => "Results".to_string(),
+        };
         let more = if self.loading_more {
-            format!("Results · {} · loading", self.results.len())
+            format!("{name} · {} · loading", self.results.len())
         } else {
-            format!("Results · {}", self.results.len())
+            format!("{name} · {}", self.results.len())
         };
         let drawn = panel(theme, &more, wide, lines);
         let area = frame.area();
@@ -849,6 +888,115 @@ impl App {
             let row = top + 1 + ((index - self.rscroll) * 2) as u16;
             self.zone(rect(area, x, row, wide, 2), Hit::Result(index));
         }
+    }
+
+    fn comment_block(comment: &crate::model::Comment, room: usize) -> Vec<String> {
+        let mut head = vec![if comment.author.is_empty() {
+            "anonymous".to_string()
+        } else {
+            comment.author.clone()
+        }];
+        if let Some(name) = &comment.reply_to {
+            head.push(format!("↪ {name}"));
+        }
+        if comment.likes > 0 {
+            head.push(format!("♥ {}", short_count(comment.likes)));
+        }
+        if let Some(created) = comment.created {
+            head.push(crate::util::ago(created, crate::util::now()));
+        }
+        let mut lines = vec![head.join(" · ")];
+        let mut body = wrap(&comment.text, room.saturating_sub(2).max(8));
+        if body.len() > 6 {
+            body.truncate(6);
+            if let Some(last) = body.last_mut() {
+                *last = format!("{}…", last.trim_end());
+            }
+        }
+        lines.extend(body.into_iter().map(|line| format!("  {line}")));
+        lines
+    }
+
+    fn draw_comments(
+        &mut self,
+        frame: &mut Frame,
+        theme: &Theme,
+        x: u16,
+        y: u16,
+        wide: u16,
+        tall: u16,
+    ) {
+        let Some(thread) = self.thread.as_mut() else {
+            return;
+        };
+        let room = (wide as usize).saturating_sub(6);
+        let rows = (tall as usize).saturating_sub(2).max(1);
+        let heights: Vec<usize> = thread
+            .items
+            .iter()
+            .map(|comment| Self::comment_block(comment, room).len() + 1)
+            .collect();
+        thread.sel = thread.sel.min(thread.items.len().saturating_sub(1));
+        if thread.sel < thread.scroll {
+            thread.scroll = thread.sel;
+        }
+        while thread.scroll < thread.sel
+            && heights[thread.scroll..=thread.sel].iter().sum::<usize>() > rows
+        {
+            thread.scroll += 1;
+        }
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for index in thread.scroll..thread.items.len() {
+            if lines.len() >= rows {
+                break;
+            }
+            let block = Self::comment_block(&thread.items[index], room);
+            let picked = index == thread.sel;
+            for (row, text) in block.into_iter().enumerate() {
+                let marker = if row == 0 {
+                    if picked {
+                        "❯ "
+                    } else {
+                        "  "
+                    }
+                } else {
+                    ""
+                };
+                let style = if row == 0 {
+                    if picked {
+                        theme.pick()
+                    } else {
+                        theme.bold()
+                    }
+                } else {
+                    theme.text()
+                };
+                lines.push(Line::styled(fit(&format!("{marker}{text}"), room), style));
+            }
+            lines.push(Line::raw(""));
+        }
+        lines.truncate(rows);
+        if lines.is_empty() {
+            lines.push(Line::styled("no comments yet", theme.soft()));
+        }
+        let count = thread
+            .total
+            .map(short_count)
+            .unwrap_or_else(|| thread.items.len().to_string());
+        let mut title = format!("Comments · {count}");
+        if thread.loading {
+            title.push_str(" · loading");
+        }
+        if !thread.video.title.is_empty() {
+            title = format!("{title} · {}", thread.video.title);
+        }
+        for (offset, line) in panel(theme, &title, wide, lines).into_iter().enumerate() {
+            put(frame, x, y + offset as u16, wide, line);
+        }
+    }
+
+    fn trail_empty(&self) -> bool {
+        self.related_of.is_none()
     }
 
     fn left_lines(&self, wide: u16) -> Vec<Line<'static>> {
@@ -1506,5 +1654,20 @@ mod tests {
         let (shown, column) = window("abcdefghij", 3, 5);
         assert_eq!(shown, "abcde");
         assert_eq!(column, 3);
+    }
+
+    #[test]
+    fn comments_render_author_likes_and_wrapped_text() {
+        let mut app = app();
+        app.thread = Some(crate::tui::app::Thread::sample(vec![
+            ("Amy", "first comment that is long enough to need wrapping across lines once the panel is narrow", 5),
+            ("Bea", "second", 0),
+        ]));
+        app.mode = Mode::Comments;
+        let screen = draw(&mut app, 50, 20);
+        assert!(screen.contains("╭─ Comments · 2"));
+        assert!(screen.contains("❯ Amy · ♥ 5"));
+        assert!(screen.contains("  Bea"));
+        assert!(screen.contains("^c quit") && screen.contains("esc back"));
     }
 }

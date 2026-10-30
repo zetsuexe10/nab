@@ -4,6 +4,7 @@ mod initials;
 mod json;
 mod net;
 mod page;
+mod people;
 mod profile;
 mod sources;
 mod suggest;
@@ -15,7 +16,7 @@ use serde_json::Value;
 
 use super::{Cursor, Entry, Page, Provider, Suggestion};
 use crate::hls;
-use crate::model::{Media, Profile, Scope, Video};
+use crate::model::{CommentPage, Media, Profile, Scope, Video};
 use crate::source::{Kind, Sources, Stream};
 
 pub use net::encode;
@@ -49,7 +50,7 @@ impl Provider for XHamster {
     }
 
     fn scopes(&self) -> &'static [Scope] {
-        &[Scope::Videos, Scope::Galleries]
+        &[Scope::Videos, Scope::Galleries, Scope::Stars]
     }
 
     fn classify(&self, input: &str) -> Option<Entry> {
@@ -80,7 +81,16 @@ impl Provider for XHamster {
         match item.media {
             Media::Gallery => live().gallery(url),
             Media::Video => live().resolve(url),
+            Media::Person => Err("open the profile instead".to_string()),
         }
+    }
+
+    fn related(&self, item: &Video) -> Result<Page, String> {
+        Ok(page_of(live().related(video_id(item)?)?))
+    }
+
+    fn comments(&self, item: &Video, page: u32) -> Result<CommentPage, String> {
+        live().comments(video_id(item)?, page)
     }
 
     fn profile(&self, url: &str, sort: &str, scope: Scope, page: u32) -> Result<Profile, String> {
@@ -103,6 +113,26 @@ fn stub(url: &str, media: Media) -> Video {
     }
 }
 
+fn nonce() -> u32 {
+    if cfg!(test) {
+        7
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0)
+    }
+}
+
+fn video_id(item: &Video) -> Result<u64, String> {
+    if item.media != Media::Video {
+        return Err("only videos have this".to_string());
+    }
+    item.id
+        .parse()
+        .map_err(|_| "open the video first".to_string())
+}
+
 fn page_of(listing: Listing) -> Page {
     Page {
         videos: listing.videos,
@@ -116,6 +146,7 @@ pub struct Next {
     template: Option<String>,
     page: u32,
     scope: Scope,
+    related: Option<u64>,
 }
 
 impl Next {
@@ -247,6 +278,10 @@ impl Client {
                 galleries.iter_mut().for_each(|item| item.site = ID);
                 (galleries, gallery::directory_paging(data))
             }
+            Scope::Stars => (
+                people::directory(data, profile::Kind::Pornstar),
+                initials::paging(data),
+            ),
         }
     }
 
@@ -258,15 +293,108 @@ impl Client {
             template: paging.template.clone(),
             page: paging.page,
             scope,
+            related: None,
         });
         Ok(Listing { videos, next })
     }
 
+    fn stars(&self, query: &str) -> Result<Listing, String> {
+        if let Some(path) = people::directory_path(query) {
+            let url = format!("{}{path}", self.base);
+            let (data, _) = self.load(&url)?;
+            let kind = people::kind_of(path);
+            let videos = people::directory(&data, kind);
+            let paging = initials::paging(&data);
+            if videos.is_empty() {
+                return Err("the directory came back empty".to_string());
+            }
+            let next = (paging.page < paging.last).then(|| Next {
+                base: url,
+                template: paging.template.clone(),
+                page: paging.page,
+                scope: Scope::Stars,
+                related: None,
+            });
+            return Ok(Listing { videos, next });
+        }
+        let videos: Vec<Video> = self
+            .suggest(query, Scope::Stars)
+            .into_iter()
+            .filter_map(|row| {
+                let url = row.profile?;
+                people::person(
+                    &serde_json::json!({
+                        "pageURL": url,
+                        "name": row.text,
+                        "videoCount": row.count
+                    }),
+                    profile::Kind::Pornstar,
+                )
+            })
+            .collect();
+        if videos.is_empty() {
+            return Err(format!("no stars match \"{}\"", query.trim()));
+        }
+        Ok(Listing { videos, next: None })
+    }
+
+    pub fn related(&self, id: u64) -> Result<Listing, String> {
+        self.related_page(id, 1)
+    }
+
+    fn related_page(&self, id: u64, page: u32) -> Result<Listing, String> {
+        let params = net::encode(&people::related_params().to_string());
+        let url = format!(
+            "{}/api/front/video/related?videoId={id}&page={page}&params={params}",
+            self.base
+        );
+        let body = net::get(&url, REFERER, true)?;
+        let data: Value = serde_json::from_str(&body).map_err(|_| unreadable())?;
+        let (mut videos, last) = people::related(&data);
+        videos.iter_mut().for_each(|video| video.site = ID);
+        if videos.is_empty() {
+            return Err(if page > 1 {
+                "no more related videos".to_string()
+            } else {
+                "no related videos".to_string()
+            });
+        }
+        let next = (page < last).then(|| Next {
+            base: String::new(),
+            template: None,
+            page,
+            scope: Scope::Videos,
+            related: Some(id),
+        });
+        Ok(Listing { videos, next })
+    }
+
+    pub fn comments(&self, id: u64, page: u32) -> Result<CommentPage, String> {
+        let call = people::comment_call(id, page.max(1)).to_string();
+        let url = format!(
+            "{}/x-api?r={}&_=0.{}",
+            self.base,
+            net::encode(&call),
+            nonce()
+        );
+        let body = net::get(&url, REFERER, true)?;
+        let data: Value = serde_json::from_str(&body).map_err(|_| unreadable())?;
+        let found = people::comments(&data, page.max(1));
+        if found.comments.is_empty() && page <= 1 {
+            return Err("no comments yet".to_string());
+        }
+        Ok(found)
+    }
+
     pub fn search(&self, query: &str, scope: Scope) -> Result<Listing, String> {
+        if scope == Scope::Stars {
+            return self.stars(query);
+        }
         let slug = query.split_whitespace().collect::<Vec<_>>().join("-");
         let root = match scope {
             Scope::Videos => "search",
             Scope::Galleries => "photos/search",
+            Scope::Stars => "search",
         };
         self.listing(
             format!("{}/{root}/{}", self.base, net::encode(&slug)),
@@ -275,6 +403,9 @@ impl Client {
     }
 
     pub fn more(&self, next: &Next) -> Result<Listing, String> {
+        if let Some(id) = next.related {
+            return self.related_page(id, next.page + 1);
+        }
         let page = next.page + 1;
         let (data, _) = self.load(&next.url(page))?;
         let (videos, paging) = Self::items(&data, next.scope);
@@ -283,6 +414,7 @@ impl Client {
             template: next.template.clone().or(paging.template),
             page,
             scope: next.scope,
+            related: None,
         });
         Ok(Listing {
             videos,
@@ -306,6 +438,7 @@ impl Client {
             template: found.paging.template.clone(),
             page,
             scope: Scope::Galleries,
+            related: None,
         };
         while found.photos.len() < wanted && page < last {
             page += 1;
@@ -443,10 +576,23 @@ impl Client {
         if scope == Scope::Galleries {
             return self.profile_galleries(&base, page);
         }
+        if profile::Kind::from_url(&base) == profile::Kind::User {
+            return self.uploader(&base, page);
+        }
         let target = profile::url_for(&base, sort, page);
         let (data, html) = self.load(&target)?;
         let heading = initials::title_of(&html);
         let mut found = profile::extract(&data, &target, heading.as_deref());
+        if found.videos.is_empty() && page <= 1 {
+            let tab = format!("{base}/videos");
+            if let Ok((more, _)) = self.load(&tab) {
+                let list = profile::extract(&more, &tab, heading.as_deref());
+                if !list.videos.is_empty() {
+                    found.videos = list.videos;
+                    found.paging = list.paging;
+                }
+            }
+        }
         found.url = base;
         found.videos.iter_mut().for_each(|video| video.site = ID);
         if found.paging.page < page && page > 1 && found.videos.is_empty() {
@@ -456,6 +602,43 @@ impl Client {
         if sort != "featured" || found.sort.is_empty() {
             found.sort = sort.to_string();
         }
+        Ok(found)
+    }
+
+    fn uploader(&self, base: &str, page: u32) -> Result<Profile, String> {
+        let tab = if page > 1 {
+            format!("{base}/videos/{page}")
+        } else {
+            format!("{base}/videos")
+        };
+        let summarize = |loaded: (Value, String), url: &str| {
+            let heading = initials::title_of(&loaded.1);
+            profile::extract(&loaded.0, url, heading.as_deref())
+        };
+        let hero = self.load(base).map(|loaded| summarize(loaded, base));
+        let listed = self.load(&tab).map(|loaded| summarize(loaded, &tab));
+        let (mut found, list) = match (hero, listed) {
+            (Ok(hero), Ok(list)) => (hero, Some(list)),
+            (Ok(hero), Err(_)) => (hero, None),
+            (Err(_), Ok(list)) => (list.clone(), Some(list)),
+            (Err(error), Err(_)) => return Err(error),
+        };
+        if let Some(list) = list.filter(|list| !list.videos.is_empty()) {
+            found.videos = list.videos;
+            found.paging = list.paging;
+        }
+        if found.videos.is_empty() {
+            return Err(if page > 1 {
+                "that page does not exist".to_string()
+            } else {
+                "this uploader has no public videos".to_string()
+            });
+        }
+        found.url = base.to_string();
+        found.videos.iter_mut().for_each(|video| video.site = ID);
+        found.paging.page = page.max(1);
+        found.sorts = Vec::new();
+        found.sort = String::new();
         Ok(found)
     }
 
@@ -493,6 +676,7 @@ impl Client {
         let area = match scope {
             Scope::Videos => "video",
             Scope::Galleries => "photo",
+            Scope::Stars => "video",
         };
         let url = format!(
             "{}/api/front/search/suggest?searchValue={}&searchScope={area}&orientation=straight",
@@ -619,6 +803,7 @@ mod tests {
             template: template.map(str::to_string),
             page: 1,
             scope: Scope::Videos,
+            related: None,
         };
         assert_eq!(
             next(
@@ -887,5 +1072,136 @@ mod tests {
         assert_eq!((found.paging.page, found.paging.last), (2, 5));
         assert_eq!(found.sort, "added");
         assert!(found.url.ends_with("/pornstars/jane-doe"));
+    }
+
+    #[test]
+    fn uploaders_list_their_videos_from_the_videos_tab() {
+        let base = crate::testserver::serve_with(|base| {
+            let landing = serde_json::json!({
+                "username": "Zed",
+                "aboutMeComponent": {"text": "hello there"}
+            });
+            let tab = serde_json::json!({
+                "username": "Zed",
+                "layoutPage": {"videoListProps": {"videoThumbProps": [row(1, base), row(2, base)]}},
+                "maxVideoPages": 3
+            });
+            let later = serde_json::json!({
+                "layoutPage": {"videoListProps": {"videoThumbProps": [row(3, base)]}},
+                "maxVideoPages": 3
+            });
+            vec![
+                file("/users/zed", page(&landing)),
+                file("/users/zed/videos", page(&tab)),
+                file("/users/zed/videos/2", page(&later)),
+            ]
+        });
+        let client = Client::at(&base);
+        let found = client
+            .profile(&format!("{base}/users/zed"), "featured", Scope::Videos, 1)
+            .unwrap();
+        assert_eq!(found.kind, "user");
+        assert_eq!(found.videos.len(), 2);
+        assert_eq!(found.paging.last, 3);
+        assert_eq!(found.bio.as_deref(), Some("hello there"));
+        assert!(found.sorts.is_empty());
+        let second = client
+            .profile(&format!("{base}/users/zed"), "featured", Scope::Videos, 2)
+            .unwrap();
+        assert_eq!(second.videos[0].id, "3");
+        assert_eq!(second.paging.page, 2);
+        let empty = crate::testserver::serve(vec![file(
+            "/users/ghost/videos",
+            page(
+                &serde_json::json!({"username": "Ghost", "aboutMeComponent": {}, "layoutPage": {"videoListProps": {"videoThumbProps": []}}}),
+            ),
+        )]);
+        let error = Client::at(&empty)
+            .profile(
+                &format!("{empty}/users/ghost"),
+                "featured",
+                Scope::Videos,
+                1,
+            )
+            .unwrap_err();
+        assert!(error.contains("no public videos"));
+    }
+
+    #[test]
+    fn related_videos_page_through_the_api() {
+        let base = crate::testserver::serve_with(|base| {
+            let params = net::encode(&people::related_params().to_string());
+            let first = serde_json::json!({"videoThumbProps": [row(11, base), row(12, base)], "maxPages": 2});
+            let second = serde_json::json!({"videoThumbProps": [row(13, base)], "maxPages": 2});
+            vec![
+                file(
+                    &format!("/api/front/video/related?videoId=7&page=1&params={params}"),
+                    first.to_string().into_bytes(),
+                ),
+                file(
+                    &format!("/api/front/video/related?videoId=7&page=2&params={params}"),
+                    second.to_string().into_bytes(),
+                ),
+            ]
+        });
+        let client = Client::at(&base);
+        let first = client.related(7).unwrap();
+        assert_eq!(first.videos.len(), 2);
+        let next = first.next.unwrap();
+        let second = client.more(&next).unwrap();
+        assert_eq!(second.videos[0].id, "13");
+        assert!(second.next.is_none());
+        assert!(client.related(8).is_err());
+    }
+
+    #[test]
+    fn comments_come_from_the_rpc_endpoint() {
+        let base = crate::testserver::serve_with(|_| {
+            let call = net::encode(&people::comment_call(7, 1).to_string());
+            let body = serde_json::json!([{
+                "responseData": [{"id": 1, "text": "first!", "author": {"name": "Amy"}, "likes": 2}],
+                "extras": {"total": 9, "paging": {"maxPages": 3, "active": 1}}
+            }]);
+            vec![file(
+                &format!("/x-api?r={call}&_=0.7"),
+                body.to_string().into_bytes(),
+            )]
+        });
+        let client = Client::at(&base);
+        let found = client.comments(7, 1).unwrap();
+        assert_eq!(found.comments[0].author, "Amy");
+        assert_eq!((found.total, found.last), (Some(9), 3));
+        assert!(client.comments(7, 2).is_err());
+    }
+
+    #[test]
+    fn the_stars_directory_lists_people_and_pages_on() {
+        let base = crate::testserver::serve_with(|_| {
+            let first = serde_json::json!({
+                "layoutPage": {"pornstarListProps": {"pornstars": [
+                    {"pageURL": "https://xhamster.com/pornstars/amy", "name": "Amy", "videoCount": 10},
+                    {"pageURL": "https://xhamster.com/pornstars/bea", "name": "Bea"}
+                ]}},
+                "paginationComponent": {"currentPageNumber": 1, "lastPageNumber": 2}
+            });
+            let second = serde_json::json!({
+                "layoutPage": {"pornstarListProps": {"pornstars": [
+                    {"pageURL": "https://xhamster.com/pornstars/cy", "name": "Cy"}
+                ]}},
+                "paginationComponent": {"currentPageNumber": 2, "lastPageNumber": 2}
+            });
+            vec![
+                file("/pornstars", page(&first)),
+                file("/pornstars/2", page(&second)),
+            ]
+        });
+        let client = Client::at(&base);
+        let found = client.search("", Scope::Stars).unwrap();
+        assert_eq!(found.videos.len(), 2);
+        assert_eq!(found.videos[0].media, Media::Person);
+        let more = client.more(&found.next.unwrap()).unwrap();
+        assert_eq!(more.videos[0].title, "Cy");
+        assert!(more.next.is_none());
+        assert!(client.search("creators", Scope::Stars).is_err());
     }
 }

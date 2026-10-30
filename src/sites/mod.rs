@@ -5,7 +5,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::model::{Profile, Scope, Video};
+use crate::model::{CommentPage, Profile, Scope, Video};
 use crate::source::Sources;
 
 pub trait Provider: Sync {
@@ -38,6 +38,14 @@ pub trait Provider: Sync {
 
     fn suggest(&self, _query: &str, _scope: Scope) -> Vec<Suggestion> {
         Vec::new()
+    }
+
+    fn related(&self, _item: &Video) -> Result<Page, String> {
+        Err(format!("{} has no related videos", self.title()))
+    }
+
+    fn comments(&self, _item: &Video, _page: u32) -> Result<CommentPage, String> {
+        Err(format!("{} has no comments", self.title()))
     }
 }
 
@@ -118,6 +126,27 @@ impl Site {
         let scopes = self.scopes();
         let at = scopes.iter().position(|item| *item == scope).unwrap_or(0);
         scopes[(at + 1) % scopes.len()]
+    }
+
+    pub fn profile_scopes(self) -> Vec<Scope> {
+        self.scopes()
+            .iter()
+            .copied()
+            .filter(|scope| *scope != Scope::Stars)
+            .collect()
+    }
+
+    pub fn next_profile_scope(self, scope: Scope) -> Scope {
+        let scopes = self.profile_scopes();
+        let at = scopes.iter().position(|item| *item == scope).unwrap_or(0);
+        scopes
+            .get((at + 1) % scopes.len().max(1))
+            .copied()
+            .unwrap_or(scope)
+    }
+
+    pub fn has_comments(self) -> bool {
+        self.0.id() == xhamster::ID
     }
 
     pub fn supports(self, scope: Scope) -> bool {
@@ -234,6 +263,20 @@ pub fn more(cursor: &Cursor) -> Result<Page, String> {
     }
 }
 
+pub fn related(item: &Video) -> Result<Page, String> {
+    match Site::named(item.site) {
+        Some(site) => site.0.related(item),
+        None => Err("unknown site".to_string()),
+    }
+}
+
+pub fn comments(item: &Video, page: u32) -> Result<CommentPage, String> {
+    match Site::named(item.site) {
+        Some(site) => site.0.comments(item, page),
+        None => Err("unknown site".to_string()),
+    }
+}
+
 pub fn resolve(item: &Video) -> Result<Sources, String> {
     match Site::named(item.site) {
         Some(site) => site.0.resolve(item),
@@ -318,7 +361,13 @@ mod tests {
         let adult = Site::named("xhamster").unwrap();
         assert_eq!(tube.next_scope(Scope::Videos), Scope::Videos);
         assert_eq!(adult.next_scope(Scope::Videos), Scope::Galleries);
-        assert_eq!(adult.next_scope(Scope::Galleries), Scope::Videos);
+        assert_eq!(adult.next_scope(Scope::Galleries), Scope::Stars);
+        assert_eq!(adult.next_scope(Scope::Stars), Scope::Videos);
+        assert_eq!(
+            adult.profile_scopes(),
+            vec![Scope::Videos, Scope::Galleries]
+        );
+        assert_eq!(adult.next_profile_scope(Scope::Galleries), Scope::Videos);
         assert!(!tube.supports(Scope::Galleries));
     }
 

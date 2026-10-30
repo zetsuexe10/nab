@@ -12,7 +12,7 @@ use super::store::Store;
 use super::theme::ThemeMode;
 use crate::download::{self, Job, Msg, Remote, Stage};
 use crate::layout::{Folder, Layout};
-use crate::model::{Profile, Scope, Video};
+use crate::model::{Comment, CommentPage, Media, Profile, Scope, Video};
 use crate::play::{self, Player};
 use crate::sites::{self, Cursor, Entry, Page, Site, Suggestion};
 use crate::source::{Kind, Sources, Stream};
@@ -28,6 +28,7 @@ pub enum Mode {
     Results,
     Formats,
     Profile,
+    Comments,
     Busy,
     Download,
     Done,
@@ -70,8 +71,57 @@ enum Work {
     More(Result<Page, String>),
     Resolved(Video, Result<Sources, String>),
     Profiled(Result<Profile, String>),
+    Related(Video, Mode, Result<Page, String>),
+    Comments(Video, Mode, u32, Result<CommentPage, String>),
     Suggested(Site, Scope, String, Vec<Suggestion>),
     Clipboard(Option<String>),
+}
+
+pub struct Thread {
+    pub video: Video,
+    pub items: Vec<Comment>,
+    pub total: Option<u64>,
+    pub page: u32,
+    pub last: u32,
+    pub sel: usize,
+    pub scroll: usize,
+    pub loading: bool,
+    back: Mode,
+}
+
+impl Thread {
+    #[cfg(test)]
+    pub fn sample(rows: Vec<(&str, &str, u64)>) -> Thread {
+        Thread {
+            video: Video::stub("7"),
+            items: rows
+                .into_iter()
+                .enumerate()
+                .map(|(index, (author, text, likes))| Comment {
+                    id: index.to_string(),
+                    author: author.to_string(),
+                    text: text.to_string(),
+                    likes,
+                    ..Comment::default()
+                })
+                .collect(),
+            total: None,
+            page: 1,
+            last: 1,
+            sel: 0,
+            scroll: 0,
+            loading: false,
+            back: Mode::Results,
+        }
+    }
+}
+
+struct Trail {
+    results: Vec<Video>,
+    sel: usize,
+    rscroll: usize,
+    cursor: Option<Cursor>,
+    from: Mode,
 }
 
 pub struct App {
@@ -89,6 +139,9 @@ pub struct App {
     pub pscroll: usize,
     profile_from: Mode,
     formats_from: Mode,
+    pub thread: Option<Thread>,
+    trail: Vec<Trail>,
+    pub related_of: Option<String>,
     pub results: Vec<Video>,
     pub sel: usize,
     pub rscroll: usize,
@@ -159,6 +212,9 @@ impl App {
             pscroll: 0,
             profile_from: Mode::Query,
             formats_from: Mode::Results,
+            thread: None,
+            trail: Vec::new(),
+            related_of: None,
             results: Vec::new(),
             sel: 0,
             rscroll: 0,
@@ -442,10 +498,12 @@ impl App {
 
     pub fn submit(&mut self) {
         let query = self.query.trim().to_string();
-        if query.is_empty() {
+        if query.is_empty() && self.scope != Scope::Stars {
             return;
         }
-        self.remember(&query);
+        if !query.is_empty() {
+            self.remember(&query);
+        }
         self.suggestions.clear();
         self.suggest_sel = None;
         self.typed_at = None;
@@ -476,6 +534,8 @@ impl App {
         self.caret = self.query.chars().count();
         self.results.clear();
         self.cursor = None;
+        self.trail.clear();
+        self.related_of = None;
         self.sel = 0;
         self.rscroll = 0;
         self.loading_more = false;
@@ -564,8 +624,196 @@ impl App {
             Work::More(result) => self.apply_more(result),
             Work::Resolved(video, result) => self.apply_resolve(video, result),
             Work::Profiled(result) => self.apply_profile(result),
+            Work::Related(video, from, result) => self.apply_related(video, from, result),
+            Work::Comments(video, back, page, result) => {
+                self.apply_comments(video, back, page, result)
+            }
             Work::Suggested(..) | Work::Clipboard(_) => {}
         }
+    }
+
+    fn numbered(&self, video: &Video) -> Video {
+        let mut video = video.clone();
+        if !video.id.chars().all(|ch| ch.is_ascii_digit()) {
+            if let Some(detail) = self
+                .sources
+                .as_ref()
+                .and_then(|sources| sources.detail.as_ref())
+                .filter(|detail| detail.site == video.site)
+            {
+                video.id = detail.id.clone();
+            }
+        }
+        video
+    }
+
+    fn open_related(&mut self, video: Option<Video>, from: Mode) {
+        let Some(video) = video else {
+            return;
+        };
+        if video.media != Media::Video {
+            self.tell("only videos have related videos");
+            return;
+        }
+        let video = self.numbered(&video);
+        self.ticket += 1;
+        self.loading_more = false;
+        self.back = from;
+        self.busy("finding related videos");
+        self.spawn(move || {
+            let result = sites::related(&video);
+            Work::Related(video, from, result)
+        });
+    }
+
+    fn apply_related(&mut self, video: Video, from: Mode, result: Result<Page, String>) {
+        match result {
+            Ok(page) if page.videos.is_empty() => self.fail("no related videos", from),
+            Ok(page) => {
+                let held = Trail {
+                    results: std::mem::take(&mut self.results),
+                    sel: self.sel,
+                    rscroll: self.rscroll,
+                    cursor: self.cursor.take(),
+                    from,
+                };
+                self.trail.push(held);
+                self.related_of = Some(video.title.clone()).filter(|title| !title.is_empty());
+                self.results = page.videos;
+                self.cursor = page.cursor;
+                self.sel = 0;
+                self.rscroll = 0;
+                self.mode = Mode::Results;
+            }
+            Err(error) => self.fail(error, from),
+        }
+    }
+
+    fn leave_related(&mut self) -> bool {
+        let Some(held) = self.trail.pop() else {
+            return false;
+        };
+        self.results = held.results;
+        self.sel = held.sel;
+        self.rscroll = held.rscroll;
+        self.cursor = held.cursor;
+        self.loading_more = false;
+        if self.trail.is_empty() {
+            self.related_of = None;
+        }
+        self.mode = match held.from {
+            Mode::Profile if self.profile.is_some() => Mode::Profile,
+            Mode::Query => Mode::Query,
+            _ if self.results.is_empty() => Mode::Query,
+            _ => Mode::Results,
+        };
+        true
+    }
+
+    fn open_comments(&mut self, video: Option<Video>, back: Mode) {
+        let Some(video) = video else {
+            return;
+        };
+        if video.media != Media::Video {
+            self.tell("only videos have comments");
+            return;
+        }
+        if !Site::named(video.site).is_some_and(Site::has_comments) {
+            self.tell("this site has no comments");
+            return;
+        }
+        let video = self.numbered(&video);
+        self.ticket += 1;
+        self.loading_more = false;
+        self.back = back;
+        self.busy("loading comments");
+        self.spawn(move || {
+            let result = sites::comments(&video, 1);
+            Work::Comments(video, back, 1, result)
+        });
+    }
+
+    fn apply_comments(
+        &mut self,
+        video: Video,
+        back: Mode,
+        page: u32,
+        result: Result<CommentPage, String>,
+    ) {
+        match result {
+            Ok(found) if page <= 1 => {
+                self.thread = Some(Thread {
+                    video,
+                    items: found.comments,
+                    total: found.total,
+                    page: found.page,
+                    last: found.last,
+                    sel: 0,
+                    scroll: 0,
+                    loading: false,
+                    back,
+                });
+                self.mode = Mode::Comments;
+            }
+            Ok(found) => {
+                if let Some(thread) = &mut self.thread {
+                    thread.loading = false;
+                    thread.page = found.page.max(page);
+                    thread.last = found.last.max(thread.page);
+                    for comment in found.comments {
+                        if !thread.items.iter().any(|held| held.id == comment.id) {
+                            thread.items.push(comment);
+                        }
+                    }
+                }
+            }
+            Err(error) if page <= 1 => self.fail(error, back),
+            Err(error) => {
+                if let Some(thread) = &mut self.thread {
+                    thread.loading = false;
+                    thread.last = thread.page;
+                }
+                self.tell(error);
+            }
+        }
+    }
+
+    fn more_comments(&mut self) {
+        let Some(thread) = &mut self.thread else {
+            return;
+        };
+        if thread.loading || thread.page >= thread.last || thread.sel + 3 < thread.items.len() {
+            return;
+        }
+        thread.loading = true;
+        let (video, back, next) = (thread.video.clone(), thread.back, thread.page + 1);
+        self.spawn(move || {
+            let result = sites::comments(&video, next);
+            Work::Comments(video, back, next, result)
+        });
+    }
+
+    fn key_comments(&mut self, key: KeyEvent) -> Flow {
+        let Some(thread) = &mut self.thread else {
+            self.mode = Mode::Results;
+            return Flow::Continue;
+        };
+        let last = thread.items.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => thread.sel = thread.sel.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => thread.sel = (thread.sel + 1).min(last),
+            KeyCode::PageUp => thread.sel = thread.sel.saturating_sub(PAGE as usize),
+            KeyCode::PageDown => thread.sel = (thread.sel + PAGE as usize).min(last),
+            KeyCode::Home | KeyCode::Char('g') => thread.sel = 0,
+            KeyCode::End | KeyCode::Char('G') => thread.sel = last,
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('c') => {
+                self.mode = thread.back;
+            }
+            KeyCode::Char('q') => return Flow::Quit,
+            _ => {}
+        }
+        self.more_comments();
+        Flow::Continue
     }
 
     fn apply_search(&mut self, result: Result<Page, String>) {
@@ -742,6 +990,7 @@ impl App {
             Mode::Results => self.key_results(key),
             Mode::Formats => self.key_formats(key),
             Mode::Profile => self.key_profile(key),
+            Mode::Comments => self.key_comments(key),
             Mode::Busy => {
                 if key.code == KeyCode::Esc {
                     self.ticket += 1;
@@ -859,6 +1108,13 @@ impl App {
             Mode::Results => self.move_result(delta),
             Mode::Formats => self.move_choice(delta),
             Mode::Profile => self.move_profile(delta),
+            Mode::Comments => {
+                if let Some(thread) = &mut self.thread {
+                    let last = thread.items.len().saturating_sub(1) as isize;
+                    thread.sel = (thread.sel as isize + delta).clamp(0, last) as usize;
+                }
+                self.more_comments();
+            }
             Mode::Query if self.dropdown() => self.move_suggestion(delta),
             _ => {}
         }
@@ -1032,9 +1288,14 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.sel = self.results.len().saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(video) = self.results.get(self.sel).cloned() {
-                    self.start_resolve(video, Mode::Results);
+                    if video.media == Media::Person {
+                        self.open_author(Some(video), Mode::Results);
+                    } else {
+                        self.start_resolve(video, Mode::Results);
+                    }
                 }
             }
+            KeyCode::Esc if self.leave_related() => {}
             KeyCode::Char('/') | KeyCode::Esc | KeyCode::Tab => {
                 self.caret = self.len();
                 self.mode = Mode::Query;
@@ -1042,6 +1303,14 @@ impl App {
             KeyCode::Char('o') => {
                 let video = self.results.get(self.sel).cloned();
                 self.open_author(video, Mode::Results);
+            }
+            KeyCode::Char('c') => {
+                let video = self.results.get(self.sel).cloned();
+                self.open_comments(video, Mode::Results);
+            }
+            KeyCode::Char('r') => {
+                let video = self.results.get(self.sel).cloned();
+                self.open_related(video, Mode::Results);
             }
             KeyCode::Char('q') => return Flow::Quit,
             _ => {}
@@ -1086,6 +1355,15 @@ impl App {
                 let video = self.current.clone();
                 self.open_author(video, Mode::Formats);
             }
+            KeyCode::Char('c') => {
+                let video = self.current.clone();
+                self.open_comments(video, Mode::Formats);
+            }
+            KeyCode::Char('r') => {
+                let video = self.current.clone();
+                let from = self.formats_from;
+                self.open_related(video, from);
+            }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 self.mode = match self.formats_from {
                     Mode::Profile if self.profile.is_some() => Mode::Profile,
@@ -1104,7 +1382,7 @@ impl App {
     }
 
     pub fn profile_scopes(&self) -> usize {
-        self.profile_site.scopes().len()
+        self.profile_site.profile_scopes().len()
     }
 
     pub fn profile_videos(&self) -> usize {
@@ -1175,7 +1453,7 @@ impl App {
         let Some(profile) = &self.profile else {
             return;
         };
-        if ids.len() < 2 || profile.scope == Scope::Galleries {
+        if ids.len() < 2 || profile.scope == Scope::Galleries || profile.kind == "user" {
             return;
         }
         let at = ids.iter().position(|id| *id == profile.sort).unwrap_or(0);
@@ -1189,7 +1467,7 @@ impl App {
         let Some(profile) = &self.profile else {
             return;
         };
-        let next = self.profile_site.next_scope(profile.scope);
+        let next = self.profile_site.next_profile_scope(profile.scope);
         if next == profile.scope {
             return;
         }
@@ -1228,6 +1506,14 @@ impl App {
                 if let Some(video) = video {
                     self.start_resolve(video, Mode::Profile);
                 }
+            }
+            KeyCode::Char('c') => {
+                let video = self
+                    .profile
+                    .as_ref()
+                    .and_then(|profile| profile.videos.get(self.psel))
+                    .cloned();
+                self.open_comments(video, Mode::Profile);
             }
             KeyCode::Right | KeyCode::Char('n') | KeyCode::Char(']') => self.turn_page(true),
             KeyCode::Left | KeyCode::Char('p') | KeyCode::Char('[') => self.turn_page(false),
@@ -2003,10 +2289,65 @@ mod tests {
         control(&mut app, 'g');
         assert_eq!(app.scope, Scope::Galleries);
         control(&mut app, 'g');
+        assert_eq!(app.scope, Scope::Stars);
+        control(&mut app, 'g');
         assert_eq!(app.scope, Scope::Videos);
+        control(&mut app, 'g');
         control(&mut app, 'g');
         control(&mut app, 's');
         assert_eq!(app.site, Site::first());
         assert_eq!(app.scope, Scope::Videos);
+    }
+
+    #[test]
+    fn comments_scroll_and_escape_returns_where_they_came_from() {
+        let mut app = sample();
+        app.thread = Some(Thread::sample(vec![
+            ("a", "x", 0),
+            ("b", "y", 0),
+            ("c", "z", 0),
+        ]));
+        app.mode = Mode::Comments;
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.thread.as_ref().unwrap().sel, 2);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.thread.as_ref().unwrap().sel, 0);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[test]
+    fn star_rows_open_profiles_and_comments_need_a_video() {
+        let mut app = sample();
+        let mut star = Video::stub("amy");
+        star.media = Media::Person;
+        star.site = "xhamster";
+        star.author_url = Some("https://xhamster.com/pornstars/amy".to_string());
+        app.results = vec![star];
+        app.sel = 0;
+        app.mode = Mode::Results;
+        press(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.mode, Mode::Results);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Busy);
+    }
+
+    #[test]
+    fn related_lists_stack_and_escape_pops_them() {
+        let mut app = sample();
+        app.mode = Mode::Results;
+        let before = app.results.len();
+        let from = Mode::Results;
+        let page = Page {
+            videos: vec![Video::stub("1"), Video::stub("2")],
+            cursor: None,
+        };
+        app.apply_related(Video::stub("9"), from, Ok(page));
+        assert_eq!(app.results.len(), 2);
+        assert!(app.related_of.is_none() || app.mode == Mode::Results);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.results.len(), before);
+        assert_eq!(app.mode, Mode::Results);
     }
 }

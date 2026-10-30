@@ -3,6 +3,7 @@ pub enum Media {
     #[default]
     Video,
     Gallery,
+    Person,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39,6 +40,7 @@ pub enum Scope {
     #[default]
     Videos,
     Galleries,
+    Stars,
 }
 
 impl Scope {
@@ -46,6 +48,7 @@ impl Scope {
         match self {
             Scope::Videos => "videos",
             Scope::Galleries => "galleries",
+            Scope::Stars => "stars",
         }
     }
 }
@@ -86,4 +89,22 @@ pub struct Profile {
     pub url: String,
     pub sorts: Vec<Choice>,
     pub sort: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Comment {
+    pub id: String,
+    pub author: String,
+    pub text: String,
+    pub likes: u64,
+    pub created: Option<u64>,
+    pub reply_to: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CommentPage {
+    pub comments: Vec<Comment>,
+    pub total: Option<u64>,
+    pub page: u32,
+    pub last: u32,
 }
