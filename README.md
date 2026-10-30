@@ -47,13 +47,13 @@ mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
 From source:
 
 ```bash
-cargo install --git https://github.com/zetsuexe10/snag --locked
+cargo install --git https://github.com/zetsuexe10/nab --locked
 ```
 
 Or clone and build:
 
 ```bash
-gh repo clone zetsuexe10/snag
+gh repo clone zetsuexe10/nab
 cd nab
 cargo install --path . --locked
 ```
@@ -62,7 +62,7 @@ Release binaries are attached to every tag: static `x86_64` and `aarch64` Linux 
 and Windows in 64-bit (`x86_64-pc-windows-msvc`) and 32-bit (`i686-pc-windows-msvc`).
 
 ```bash
-gh release download --repo zetsuexe10/snag \
+gh release download --repo zetsuexe10/nab \
   --pattern 'nab-x86_64-unknown-linux-musl.tar.gz' \
   --dir /tmp/nab
 tar -xzf /tmp/nab/nab-x86_64-unknown-linux-musl.tar.gz -C ~/.local/bin
@@ -71,7 +71,7 @@ tar -xzf /tmp/nab/nab-x86_64-unknown-linux-musl.tar.gz -C ~/.local/bin
 On Linux the helper script picks the right archive for you:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zetsuexe10/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zetsuexe10/nab/master/install.sh | bash
 ```
 
 ## Use
