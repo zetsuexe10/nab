@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${NAB_REPO:-zetsuexe10/snag}"
+repo="${NAB_REPO:-zetsuexe10/nab"
 prefix="${PREFIX:-$HOME/.local}"
 bin="$prefix/bin"
 
