@@ -1,7 +1,10 @@
 use serde_json::Value;
 
-use super::json::{array, decode_entities, dig, find_array, first_text, flag, number, text};
 use crate::model::{Paging, Video};
+use crate::sites::json::{
+    array, count, decode_entities, dig, find_array, first_text, flag, number, text,
+};
+use crate::source::Credit;
 use crate::util;
 
 pub fn parse(html: &str) -> Option<Value> {
@@ -111,7 +114,7 @@ pub fn title_of(html: &str) -> Option<String> {
             .unwrap_or(inner.len());
         inner.replace_range(start..end, "");
     }
-    let cleaned = super::json::strip_tags(&inner);
+    let cleaned = crate::sites::json::strip_tags(&inner);
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
@@ -290,7 +293,7 @@ pub fn page_title(initials: &Value) -> Option<String> {
         dig(initials, "videoEntity.title"),
         dig(initials, "videoModel.title"),
     ])
-    .map(|title| super::json::tidy(&title))
+    .map(|title| crate::sites::json::tidy(&title))
 }
 
 pub fn detail(initials: &Value, url: &str) -> Video {
@@ -350,8 +353,127 @@ pub fn blocked(initials: &Value) -> bool {
             return false;
         }
     }
+    for path in [
+        "galleryPage",
+        "photosPage",
+        "galleriesComponent",
+        "searchResultsPhotoComponent",
+        "searchVideoSuggestions",
+    ] {
+        if dig(initials, path).is_some() {
+            return false;
+        }
+    }
+    if !super::gallery::listing(initials).is_empty()
+        || !super::gallery::photos(initials).is_empty()
+        || !super::gallery::person(initials).0.is_empty()
+        || !super::people::directory(initials, super::profile::Kind::Pornstar).is_empty()
+    {
+        return false;
+    }
     !(paging(initials).last > 1
         || !array(initials, "layoutPage.pornstarListProps.pornstars").is_empty())
+}
+
+fn credit_kind(tag: &Value, url: &str) -> &'static str {
+    let on = |key: &str| flag(tag.get(key));
+    if on("isPornstar") {
+        "pornstar"
+    } else if on("isCeleb") {
+        "celebrity"
+    } else if on("isCreator") {
+        "creator"
+    } else if on("isChannel") {
+        "channel"
+    } else if on("isUser") {
+        "user"
+    } else if on("isCategory") {
+        "category"
+    } else if on("isLanguage") {
+        "language"
+    } else if on("isTag") {
+        "tag"
+    } else if url.contains("/pornstars/") {
+        "pornstar"
+    } else if url.contains("/celebrities/") {
+        "celebrity"
+    } else if url.contains("/creators/") {
+        "creator"
+    } else if url.contains("/channels/") {
+        "channel"
+    } else if url.contains("/users/") {
+        "user"
+    } else if url.contains("/categories/") {
+        "category"
+    } else {
+        "tag"
+    }
+}
+
+pub fn credits(initials: &Value) -> (Vec<Credit>, Vec<Credit>) {
+    let mut cast: Vec<Credit> = Vec::new();
+    let mut tags: Vec<Credit> = Vec::new();
+    for model in array(initials, "videoEntity.pornstarModels") {
+        let name = first_text(&[
+            model.get("displayName"),
+            model.get("name"),
+            model.get("nameNormalized"),
+            model.get("nickname"),
+        ]);
+        let url = first_text(&[model.get("pageURL"), model.get("url")]).or_else(|| {
+            first_text(&[model.get("inurl"), model.get("slug"), model.get("username")])
+                .map(|slug| format!("{}/pornstars/{slug}", super::SITE))
+        });
+        let (Some(name), Some(url)) = (name, url) else {
+            continue;
+        };
+        if !cast.iter().any(|held| held.url == url) {
+            cast.push(Credit {
+                name: decode_entities(&name),
+                url,
+                kind: "pornstar",
+            });
+        }
+    }
+    for tag in array(initials, "videoTagsComponent.tags") {
+        let name = first_text(&[tag.get("name"), tag.get("nameEn")]);
+        let url = text(tag.get("url"));
+        let (Some(name), Some(url)) = (name, url) else {
+            continue;
+        };
+        let credit = Credit {
+            name: decode_entities(&name),
+            url,
+            kind: credit_kind(tag, &name_url(tag)),
+        };
+        let bucket = if credit.is_person() {
+            &mut cast
+        } else {
+            &mut tags
+        };
+        if !bucket.iter().any(|held| held.url == credit.url) {
+            bucket.push(credit);
+        }
+    }
+    (cast, tags)
+}
+
+fn name_url(tag: &Value) -> String {
+    text(tag.get("url")).unwrap_or_default()
+}
+
+pub fn rating(initials: &Value) -> Option<String> {
+    let node =
+        dig(initials, "videoEntity.rating").or_else(|| dig(initials, "videoModel.rating"))?;
+    let likes = count(&[node.get("likes")]).filter(|found| *found > 0);
+    let dislikes = count(&[node.get("dislikes")]).unwrap_or(0);
+    let mut parts = Vec::new();
+    if let Some(likes) = likes {
+        let share = likes * 100 / (likes + dislikes).max(1);
+        parts.push(format!("{share}% liked"));
+        parts.push(format!("{} likes", util::short_count(likes)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 #[cfg(test)]
@@ -429,5 +551,44 @@ mod tests {
         assert!(blocked(&json!({"nothing": 1})));
         assert!(!blocked(&json!({"xplayerSettings": {}})));
         assert!(!blocked(&json!({"pagination": {"maxPages": 4}})));
+    }
+
+    #[test]
+    fn credits_split_performers_channels_and_tags() {
+        let data = json!({
+            "videoEntity": {
+                "pornstarModels": [{"name": "Amy Doe", "inurl": "amy-doe"}],
+                "rating": {"likes": 900, "dislikes": 100}
+            },
+            "videoTagsComponent": {"tags": [
+                {"name": "Amy Doe", "url": "https://xhamster.com/pornstars/amy-doe", "isPornstar": true},
+                {"name": "Studio X", "url": "https://xhamster.com/channels/studio-x", "isChannel": true},
+                {"name": "Blonde", "url": "https://xhamster.com/tags/blonde", "isTag": true},
+                {"name": "Anal", "url": "https://xhamster.com/categories/anal"}
+            ]}
+        });
+        let (cast, tags) = credits(&data);
+        let names: Vec<&str> = cast.iter().map(|credit| credit.name.as_str()).collect();
+        assert_eq!(names, vec!["Amy Doe", "Studio X"]);
+        assert_eq!(cast[0].url, "https://xhamster.com/pornstars/amy-doe");
+        assert_eq!(cast[1].kind, "channel");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[1].kind, "category");
+        assert_eq!(rating(&data).as_deref(), Some("90% liked · 900 likes"));
+        assert_eq!(rating(&json!({})), None);
+    }
+
+    #[test]
+    fn gallery_and_directory_pages_are_not_walls_even_on_one_page() {
+        let gallery =
+            json!({"galleryPage": {"photoItems": [{"id": 1, "imgSrc": "https://i/1.jpg"}]}});
+        let photos = json!({"photosPage": {"galleriesItems": []}});
+        let stars =
+            json!({"layoutPage": {"persons": [{"pageURL": "https://x/pornstars/a", "name": "A"}]}});
+        let person = json!({"galleriesComponent": {"galleries": []}});
+        for page in [gallery, photos, stars, person] {
+            assert!(!blocked(&page));
+        }
+        assert!(blocked(&json!({"unrelated": 1})));
     }
 }

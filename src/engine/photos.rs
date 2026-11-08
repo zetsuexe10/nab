@@ -54,6 +54,9 @@ fn get(photo: &Photo, index: usize, referer: Option<&str>, folder: &Path) -> Res
         .header("accept", "image/avif,image/webp,image/*,*/*;q=0.8");
     if let Some(referer) = referer {
         request = request.header("referer", referer);
+        if let Some(origin) = crate::util::origin(referer) {
+            request = request.header("origin", origin);
+        }
     }
     let mut response = request
         .call()

@@ -4,6 +4,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::bytes::{truncated, write_failed, Cur, Put, Res, Window};
+use super::ilst;
+use crate::model::Meta;
 
 const MAX_BOX: u64 = 1 << 28;
 const MAX_SAMPLES: usize = 10_000_000;
@@ -974,7 +976,14 @@ fn build_trak(
     (atom(b"trak", &trak), movie_duration)
 }
 
-fn build_moov(parts: &[Part], chunks: &[Chunk], base: u64, wide: bool, now: u64) -> Vec<u8> {
+fn build_moov(
+    parts: &[Part],
+    chunks: &[Chunk],
+    base: u64,
+    wide: bool,
+    now: u64,
+    tags: &[u8],
+) -> Vec<u8> {
     let mut traks = Vec::new();
     let mut duration = 0u64;
     for (index, part) in parts.iter().enumerate() {
@@ -1004,6 +1013,7 @@ fn build_moov(parts: &[Part], chunks: &[Chunk], base: u64, wide: bool, now: u64)
     mvhd.put_u32(parts.len() as u32 + 1);
     let mut body = full(b"mvhd", long as u8, 0, &mvhd);
     body.extend_from_slice(&traks);
+    body.extend_from_slice(tags);
     atom(b"moov", &body)
 }
 
@@ -1028,21 +1038,36 @@ fn build_ftyp(parts: &[Part]) -> Vec<u8> {
     atom(b"ftyp", &body)
 }
 
-pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
+pub fn merge(video: &Path, audio: &Path, out: &Path, meta: Option<&Meta>) -> Res<()> {
     write(
         vec![
             demux(video)?.into_part(b"vide")?,
             demux(audio)?.into_part(b"soun")?,
         ],
         out,
+        meta,
     )
 }
 
-pub fn extract_audio(source: &Path, out: &Path) -> Res<()> {
-    write(vec![demux(source)?.into_part(b"soun")?], out)
+pub fn extract_audio(source: &Path, out: &Path, meta: Option<&Meta>) -> Res<()> {
+    write(vec![demux(source)?.into_part(b"soun")?], out, meta)
 }
 
-fn write(mut parts: Vec<Part>, out: &Path) -> Res<()> {
+pub fn retag(source: &Path, out: &Path, meta: &Meta) -> Res<()> {
+    let mut parts = Vec::new();
+    for handler in [b"vide", b"soun"] {
+        if let Ok(part) = demux(source)?.into_part(handler) {
+            parts.push(part);
+        }
+    }
+    if parts.is_empty() {
+        return Err("no audio or video track found".to_string());
+    }
+    write(parts, out, Some(meta))
+}
+
+fn write(mut parts: Vec<Part>, out: &Path, meta: Option<&Meta>) -> Res<()> {
+    let tags = meta.map(ilst::udta).unwrap_or_default();
     let (chunks, total) = plan(&parts);
     let wide = total > 0xffff_ffff - (64 << 20);
     let now = SystemTime::now()
@@ -1051,10 +1076,10 @@ fn write(mut parts: Vec<Part>, out: &Path) -> Res<()> {
         .unwrap_or(0)
         + UNIX_TO_MP4;
     let ftyp = build_ftyp(&parts);
-    let sized = build_moov(&parts, &chunks, 0, wide, now);
+    let sized = build_moov(&parts, &chunks, 0, wide, now, &tags);
     let mdat_header: u64 = if total + 8 > 0xffff_ffff { 16 } else { 8 };
     let base = ftyp.len() as u64 + sized.len() as u64 + mdat_header;
-    let moov = build_moov(&parts, &chunks, base, wide, now);
+    let moov = build_moov(&parts, &chunks, base, wide, now, &tags);
     if moov.len() != sized.len() {
         return Err("could not lay out the file".to_string());
     }

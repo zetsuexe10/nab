@@ -1,7 +1,7 @@
 mod cipher;
 mod gallery;
 mod initials;
-mod json;
+use crate::sites::json;
 mod net;
 mod page;
 mod people;
@@ -19,7 +19,6 @@ use crate::hls;
 use crate::model::{CommentPage, Media, Profile, Scope, Video};
 use crate::source::{Kind, Sources, Stream};
 
-pub use net::encode;
 #[cfg(test)]
 pub use profile::sample as sample_profile;
 
@@ -287,7 +286,11 @@ impl Client {
 
     fn listing(&self, url: String, scope: Scope) -> Result<Listing, String> {
         let (data, _) = self.load(&url)?;
-        let (videos, paging) = Self::items(&data, scope);
+        self.shape(url, scope, &data)
+    }
+
+    fn shape(&self, url: String, scope: Scope, data: &Value) -> Result<Listing, String> {
+        let (videos, paging) = Self::items(data, scope);
         let next = (paging.page < paging.last && !videos.is_empty()).then(|| Next {
             base: url,
             template: paging.template.clone(),
@@ -396,10 +399,29 @@ impl Client {
             Scope::Galleries => "photos/search",
             Scope::Stars => "search",
         };
-        self.listing(
-            format!("{}/{root}/{}", self.base, net::encode(&slug)),
-            scope,
-        )
+        let url = format!("{}/{root}/{}", self.base, net::encode(&slug));
+        if scope != Scope::Videos {
+            return self.listing(url, scope);
+        }
+        let (data, _) = self.load(&url)?;
+        let mut listing = self.shape(url, scope, &data)?;
+        let from_page = people::matches(&data);
+        let from_suggest: Vec<Video> = self
+            .suggest(query, Scope::Videos)
+            .into_iter()
+            .filter_map(|row| {
+                let url = row.profile?;
+                people::person(
+                    &serde_json::json!({"pageURL": url, "name": row.text, "videoCount": row.count}),
+                    profile::Kind::Pornstar,
+                )
+            })
+            .collect();
+        let found = people::merge_people(from_page, from_suggest, 5);
+        if !found.is_empty() {
+            listing.videos.splice(0..0, found);
+        }
+        Ok(listing)
     }
 
     pub fn more(&self, next: &Next) -> Result<Listing, String> {
@@ -466,6 +488,9 @@ impl Client {
             format!("{total} photos")
         };
         Ok(Sources {
+            cast: Vec::new(),
+            tags: Vec::new(),
+            rating: None,
             title: Some(found.item.title.clone()).filter(|title| !title.is_empty()),
             streams: vec![Stream {
                 provider: INITIALS,
@@ -480,6 +505,7 @@ impl Client {
             }],
             detail: Some(found.item),
             photos: found.photos,
+            meta: None,
             preferred: Some(INITIALS),
         })
     }
@@ -547,7 +573,12 @@ impl Client {
             detail.site = ID;
             detail
         });
+        let (cast, tags) = data.as_ref().map(initials::credits).unwrap_or_default();
+        let rating = data.as_ref().and_then(initials::rating);
         let mut resolved = Sources {
+            cast,
+            tags,
+            rating,
             title: detail
                 .as_ref()
                 .map(|video| video.title.clone())
@@ -555,6 +586,7 @@ impl Client {
             streams: Vec::new(),
             detail,
             photos: Vec::new(),
+            meta: None,
             preferred: Some(INITIALS),
         };
         resolved

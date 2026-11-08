@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::theme::ThemeMode;
+use crate::mux::Container;
 use crate::sites::Site;
 
 const LIMIT: usize = 50;
@@ -68,6 +69,16 @@ impl Store {
 
     pub fn save_theme(&self, mode: ThemeMode) {
         self.write("theme", mode.label());
+    }
+
+    pub fn format(&self) -> Option<Container> {
+        fs::read_to_string(self.dir.join("format"))
+            .ok()
+            .and_then(|text| Container::parse(text.trim()))
+    }
+
+    pub fn save_format(&self, format: Option<Container>) {
+        self.write("format", format.map_or("native", Container::extension));
     }
 
     pub fn site(&self) -> Option<Site> {

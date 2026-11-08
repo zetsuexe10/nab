@@ -1,11 +1,12 @@
 pub mod innertube;
 pub mod search;
+pub mod tags;
 pub mod ytultra;
 
 use serde_json::Value;
 
 use super::{Cursor, Entry, Page, Provider, Suggestion};
-use crate::model::{Scope, Video};
+use crate::model::{Meta, Scope, Video};
 use crate::source::{Kind, Sources, Stream};
 
 pub const ID: &str = "youtube";
@@ -50,7 +51,17 @@ impl Provider for YouTube {
     }
 
     fn resolve(&self, item: &Video) -> Result<Sources, String> {
-        resolve(&item.id)
+        let mut sources = resolve(&item.id)?;
+        if sources.meta.is_none() {
+            let title = sources.title.as_deref().unwrap_or(&item.title);
+            let mut meta = Meta::basic(title, &item.channel);
+            if !item.id.is_empty() {
+                meta.url = Some(format!("https://www.youtube.com/watch?v={}", item.id));
+                meta.cover_urls = vec![format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", item.id)];
+            }
+            sources.meta = (!meta.is_empty()).then(|| Box::new(meta));
+        }
+        Ok(sources)
     }
 
     fn suggest(&self, query: &str, _scope: Scope) -> Vec<Suggestion> {
@@ -133,15 +144,12 @@ fn suggest(query: &str) -> Vec<Suggestion> {
     }
     let url = format!(
         "https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q={}",
-        super::xhamster::encode(query)
+        crate::sites::net::encode(query)
     );
-    let Ok(mut response) = ureq::get(&url)
-        .header("user-agent", crate::download::USER_AGENT)
-        .call()
-    else {
-        return Vec::new();
-    };
-    let Ok(body) = response.body_mut().read_to_string() else {
+    let Ok(body) = crate::sites::net::fetch(
+        &url,
+        &[("user-agent", crate::download::USER_AGENT.to_string())],
+    ) else {
         return Vec::new();
     };
     shape_suggestions(&body)

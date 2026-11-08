@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 
-use super::json::{array, count, decode_entities, find_array, first_text, flag, tidy};
 use super::profile::Kind;
 use crate::model::{Comment, CommentPage, Media, Video};
+use crate::sites::json::{array, count, decode_entities, find_array, first_text, flag, tidy};
 use crate::util::short_count;
 
 pub const KINDS: [(&str, &str, &str); 4] = [
@@ -139,6 +139,38 @@ fn dedup(items: Vec<Video>) -> Vec<Video> {
         .collect()
 }
 
+pub fn matches(initials: &Value) -> Vec<Video> {
+    let list = array(initials, "searchVideoSuggestions.creators");
+    let found: Vec<Video> = if list.is_empty() {
+        find_array(initials, "creators", &[])
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|raw| person(raw, Kind::Creator))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        list.iter()
+            .filter_map(|raw| person(raw, Kind::Creator))
+            .collect()
+    };
+    dedup(found)
+}
+
+pub fn merge_people(mut first: Vec<Video>, more: Vec<Video>, cap: usize) -> Vec<Video> {
+    for item in more {
+        if first.len() >= cap {
+            break;
+        }
+        if !first.iter().any(|held| held.url == item.url) {
+            first.push(item);
+        }
+    }
+    first.truncate(cap);
+    first
+}
+
 pub fn kind_of(path: &str) -> Kind {
     Kind::from_url(&format!("{path}/"))
 }
@@ -227,7 +259,7 @@ fn comment(raw: &Value, index: usize) -> Option<Comment> {
 }
 
 fn strip(html: &str) -> String {
-    super::json::strip_tags(html)
+    crate::sites::json::strip_tags(html)
 }
 
 pub fn comments(data: &Value, page: u32) -> CommentPage {
@@ -263,6 +295,26 @@ pub fn comments(data: &Value, page: u32) -> CommentPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_pages_offer_matching_people_first() {
+        let page = json!({"searchVideoSuggestions": {"creators": [
+            {"url": "https://xhamster.com/creators/sweetie-fox", "displayName": "Sweetie Fox", "videoCount": 99}
+        ]}});
+        let found = matches(&page);
+        assert_eq!(found[0].title, "Sweetie Fox");
+        assert_eq!(found[0].channel, "creator");
+        let extra = vec![
+            found[0].clone(),
+            person(
+                &json!({"pageURL": "https://xhamster.com/pornstars/x", "name": "X"}),
+                Kind::Pornstar,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(merge_people(found, extra, 5).len(), 2);
+        assert!(matches(&json!({})).is_empty());
+    }
 
     #[test]
     fn keywords_pick_a_directory() {

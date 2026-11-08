@@ -4,51 +4,45 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
-use std::time::Duration;
 
-use crate::download::{Msg, Remote, USER_AGENT};
+use crate::download::{Msg, Remote};
 use crate::hls;
+use crate::http;
 
 const WORKERS: usize = 6;
-const ATTEMPTS: u32 = 3;
 
 fn get_segment(
     url: &str,
     referer: Option<&str>,
     path: &Path,
     received: &AtomicU64,
+    cancel: &AtomicBool,
     tx: &Sender<Msg>,
-) -> Result<(), String> {
-    let mut request = ureq::get(url)
-        .header("user-agent", USER_AGENT)
-        .header("accept", "*/*");
-    if let Some(referer) = referer {
-        request = request.header("referer", referer);
-    }
-    let mut response = request
-        .call()
-        .map_err(|error| format!("download failed: {error}"))?;
-    let mut reader = response.body_mut().as_reader();
-    let mut writer = BufWriter::new(
-        File::create(path).map_err(|error| format!("cannot write download: {error}"))?,
-    );
-    let mut buffer = [0u8; 65536];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("download failed: {error}"))?;
-        if read == 0 {
-            break;
-        }
+) -> Result<Option<()>, String> {
+    let mut taken = 0u64;
+    let outcome = (|| {
+        let mut response = http::get(url, referer, None)?;
+        let mut reader = response.body_mut().as_reader();
+        let mut writer = BufWriter::new(
+            File::create(path).map_err(|error| format!("cannot write download: {error}"))?,
+        );
+        let Some(_) = http::pump(&mut reader, &mut writer, cancel, |read| {
+            taken += read;
+            let total = received.fetch_add(read, Ordering::Relaxed) + read;
+            let _ = tx.send(Msg::Progress(total));
+        })?
+        else {
+            return Ok(None);
+        };
         writer
-            .write_all(&buffer[..read])
+            .flush()
             .map_err(|error| format!("cannot write download: {error}"))?;
-        let total = received.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
-        let _ = tx.send(Msg::Progress(total));
+        Ok(Some(()))
+    })();
+    if !matches!(outcome, Ok(Some(()))) {
+        received.fetch_sub(taken, Ordering::Relaxed);
     }
-    writer
-        .flush()
-        .map_err(|error| format!("cannot write download: {error}"))
+    outcome
 }
 
 fn container(first: &Path, has_init: bool) -> &'static str {
@@ -120,19 +114,19 @@ pub fn fetch(
                 if index >= count {
                     return;
                 }
-                let mut outcome = Err(String::new());
-                for attempt in 0..ATTEMPTS {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    outcome = get_segment(&items[index], referer, &path_of(index), received, &tx);
-                    if outcome.is_ok() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(250 * (u64::from(attempt) + 1)));
-                }
+                let outcome = http::retry(cancel, || {
+                    get_segment(
+                        &items[index],
+                        referer,
+                        &path_of(index),
+                        received,
+                        cancel,
+                        &tx,
+                    )
+                });
                 match outcome {
-                    Ok(()) => {
+                    Ok(None) => return,
+                    Ok(Some(())) => {
                         let done = finished.fetch_add(1, Ordering::Relaxed) + 1;
                         let seen = received.load(Ordering::Relaxed);
                         let estimate = seen.saturating_mul(count as u64) / done as u64;

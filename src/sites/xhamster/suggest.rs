@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::json::{count, strip_tags, text};
+use crate::sites::json::{count, strip_tags, text};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {

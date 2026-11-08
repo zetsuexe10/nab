@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use crate::download::USER_AGENT;
 
-pub const COOKIE: &str = "age_verified=1; platform=desktop; lang=en; x_csrf_token=1";
 const RETRIES: u32 = 3;
 
 fn transient(error: &ureq::Error) -> bool {
@@ -13,14 +12,14 @@ fn transient(error: &ureq::Error) -> bool {
     }
 }
 
-pub fn get(url: &str, referer: &str, xhr: bool) -> Result<String, String> {
+pub fn get(url: &str, referer: &str, cookie: &str, xhr: bool) -> Result<String, String> {
     let mut last = String::new();
     for attempt in 0..=RETRIES {
         let mut request = ureq::get(url)
             .header("user-agent", USER_AGENT)
             .header("accept-language", "en-US,en;q=0.9")
             .header("referer", referer)
-            .header("cookie", COOKIE);
+            .header("cookie", cookie);
         request = if xhr {
             request
                 .header("accept", "*/*")
@@ -52,6 +51,39 @@ pub fn get(url: &str, referer: &str, xhr: bool) -> Result<String, String> {
         }
     }
     Err(last)
+}
+
+pub fn post(
+    url: &str,
+    headers: &[(&str, String)],
+    body: &str,
+    what: &str,
+) -> Result<String, String> {
+    let mut request = ureq::post(url).header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, value.as_str());
+    }
+    let mut response = request
+        .send(body)
+        .map_err(|error| format!("{what} failed: {error}"))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| format!("{what} failed: {error}"))
+}
+
+pub fn fetch(url: &str, headers: &[(&str, String)]) -> Result<String, String> {
+    let mut request = ureq::get(url);
+    for (name, value) in headers {
+        request = request.header(*name, value.as_str());
+    }
+    let mut response = request
+        .call()
+        .map_err(|error| format!("request failed: {error}"))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| format!("request failed: {error}"))
 }
 
 pub fn encode(input: &str) -> String {

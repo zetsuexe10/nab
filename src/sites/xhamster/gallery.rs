@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-use super::json::{array, count, decode_entities, dig, first_text, text, tidy};
 use crate::model::{Media, Paging, Photo, Video};
+use crate::sites::json::{array, count, decode_entities, dig, first_text, text, tidy};
 use crate::util;
 
 #[derive(Clone, Debug)]
@@ -227,11 +227,21 @@ pub fn paging_at(initials: &Value, paths: &[&str]) -> Paging {
     }
 }
 
+fn first_url(raw: String) -> Option<String> {
+    let token = raw
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .find(|part| part.starts_with("http") || part.starts_with("//"))?;
+    Some(match token.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => token.to_string(),
+    })
+}
+
 fn photo_items(raw: &[Value]) -> Vec<Photo> {
     raw.iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            let url = first_text(&[row.get("imgSrc"), row.get("imgSrcset"), row.get("link")])?;
+            let url = first_text(&[row.get("imgSrc"), row.get("imgSrcset")]).and_then(first_url)?;
             Some(Photo {
                 id: id_text(row.get("id")).unwrap_or_else(|| index.to_string()),
                 url,
@@ -244,7 +254,7 @@ fn model_photos(raw: &[Value]) -> Vec<Photo> {
     raw.iter()
         .enumerate()
         .filter_map(|(index, row)| {
-            let url = text(row.get("imageURL"))?;
+            let url = text(row.get("imageURL")).and_then(first_url)?;
             Some(Photo {
                 id: id_text(row.get("id")).unwrap_or_else(|| index.to_string()),
                 url,

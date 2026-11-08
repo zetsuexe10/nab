@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use super::cipher::decipher_url;
-use super::json::{dig, text};
 use crate::hls;
+use crate::sites::json::{dig, text};
 
 pub const CODECS: [&str; 4] = ["h264", "h265", "av1", "vp9"];
 

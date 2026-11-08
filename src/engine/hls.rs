@@ -139,18 +139,8 @@ pub fn parse_playlist(text: &str, base: &str) -> Playlist {
 }
 
 pub fn fetch(url: &str, referer: Option<&str>) -> Result<String, String> {
-    let mut request = ureq::get(url)
-        .header("user-agent", crate::download::USER_AGENT)
-        .header("accept", "*/*");
-    if let Some(referer) = referer {
-        request = request.header("referer", referer);
-    }
-    request
-        .call()
-        .map_err(|error| format!("playlist failed: {error}"))?
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("playlist failed: {error}"))
+    crate::http::text(url, referer)
+        .map_err(|error| error.replace("download failed", "playlist failed"))
 }
 
 #[cfg(test)]

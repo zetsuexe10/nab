@@ -45,23 +45,23 @@ fn context() -> Value {
             "clientVersion": CLIENT,
             "hl": "en",
             "gl": "US",
-        }
+        },
+        "user": {"lockedSafetyMode": false}
     })
 }
 
 fn call(body: &Value) -> Result<Value, String> {
-    let mut response = ureq::post(SEARCH_API)
-        .header("user-agent", USER_AGENT)
-        .header("accept-language", "en-US,en;q=0.9")
-        .header("content-type", "application/json")
-        .header("origin", "https://www.youtube.com")
-        .header("referer", "https://www.youtube.com/")
-        .send(body.to_string())
-        .map_err(|error| format!("search failed: {error}"))?;
-    let text = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("search failed: {error}"))?;
+    let headers = [
+        ("user-agent", USER_AGENT.to_string()),
+        ("accept-language", "en-US,en;q=0.9".to_string()),
+        (
+            "cookie",
+            "SOCS=CAI; CONSENT=YES+1; PREF=f6=40000000&hl=en".to_string(),
+        ),
+        ("origin", "https://www.youtube.com".to_string()),
+        ("referer", "https://www.youtube.com/".to_string()),
+    ];
+    let text = crate::sites::net::post(SEARCH_API, &headers, &body.to_string(), "search")?;
     serde_json::from_str(&text).map_err(|_| "could not read search results".to_string())
 }
 
@@ -142,6 +142,16 @@ fn collect_videos(value: &Value, out: &mut Vec<Video>) {
                     out.push(video);
                 }
             }
+            if let Some(model) = map.get("lockupViewModel") {
+                if let Some(video) = parse_lockup(model) {
+                    out.push(video);
+                }
+            }
+            if let Some(model) = map.get("shortsLockupViewModel") {
+                if let Some(video) = parse_short(model) {
+                    out.push(video);
+                }
+            }
             for nested in map.values() {
                 collect_videos(nested, out);
             }
@@ -190,6 +200,111 @@ fn parse_renderer(renderer: &Value) -> Option<Video> {
     })
 }
 
+fn parse_lockup(model: &Value) -> Option<Video> {
+    if model.get("contentType").and_then(Value::as_str) != Some("LOCKUP_CONTENT_TYPE_VIDEO") {
+        return None;
+    }
+    let id = model.get("contentId")?.as_str()?.to_string();
+    let meta = model.pointer("/metadata/lockupMetadataViewModel")?;
+    let title = text_of(meta.get("title"));
+    if title.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(rows) = meta
+        .pointer("/metadata/contentMetadataViewModel/metadataRows")
+        .and_then(Value::as_array)
+    {
+        for row in rows {
+            if let Some(items) = row.get("metadataParts").and_then(Value::as_array) {
+                for item in items {
+                    let text = text_of(item.get("text"));
+                    if !text.is_empty() {
+                        parts.push(text);
+                    }
+                }
+            }
+        }
+    }
+    let mut duration = String::new();
+    if let Some(overlays) = model
+        .pointer("/contentImage/thumbnailViewModel/overlays")
+        .and_then(Value::as_array)
+    {
+        for overlay in overlays {
+            if let Some(badges) = overlay
+                .pointer("/thumbnailBottomOverlayViewModel/badges")
+                .and_then(Value::as_array)
+            {
+                for badge in badges {
+                    let text = badge
+                        .pointer("/thumbnailBadgeViewModel/text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if !text.is_empty() {
+                        duration = text.to_string();
+                    }
+                }
+            }
+        }
+    }
+    let views = parts
+        .iter()
+        .find(|part| part.contains("view") || part.contains("watching"))
+        .cloned()
+        .unwrap_or_default();
+    let published = parts
+        .iter()
+        .find(|part| {
+            part.contains("ago") || part.contains("Streamed") || part.contains("Premiered")
+        })
+        .cloned()
+        .unwrap_or_default();
+    let channel = parts
+        .iter()
+        .find(|part| **part != views && **part != published)
+        .cloned()
+        .unwrap_or_default();
+    Some(Video {
+        id,
+        title,
+        channel,
+        duration: if duration.is_empty() {
+            "live".to_string()
+        } else {
+            duration
+        },
+        views,
+        published,
+        ..Video::default()
+    })
+}
+
+fn parse_short(model: &Value) -> Option<Video> {
+    let id = model
+        .pointer("/onTap/innertubeCommand/reelWatchEndpoint/videoId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            model
+                .get("entityId")
+                .and_then(Value::as_str)
+                .map(|id| id.trim_start_matches("shorts-shelf-item-"))
+        })?
+        .to_string();
+    let title = text_of(model.pointer("/overlayMetadata/primaryText"));
+    if title.is_empty() || id.len() != 11 {
+        return None;
+    }
+    Some(Video {
+        id,
+        title,
+        channel: String::new(),
+        duration: "short".to_string(),
+        views: text_of(model.pointer("/overlayMetadata/secondaryText")),
+        ..Video::default()
+    })
+}
+
 fn text_of(value: Option<&Value>) -> String {
     let Some(Value::Object(map)) = value else {
         return String::new();
@@ -231,6 +346,35 @@ mod tests {
         assert_eq!(videos[0].title, "Khola Janala");
         assert_eq!(videos[0].duration, "5:40");
         assert_eq!(videos[0].channel, "SWAT");
+    }
+
+    #[test]
+    fn parses_lockup_and_short_view_models() {
+        let json: Value = serde_json::from_str(
+            r#"{"items":[
+            {"lockupViewModel":{"contentId":"abcdefghijk","contentType":"LOCKUP_CONTENT_TYPE_VIDEO",
+              "contentImage":{"thumbnailViewModel":{"overlays":[{"thumbnailBottomOverlayViewModel":{"badges":[{"thumbnailBadgeViewModel":{"text":"12:34"}}]}}]}},
+              "metadata":{"lockupMetadataViewModel":{"title":{"content":"A mature title"},
+                "metadata":{"contentMetadataViewModel":{"metadataRows":[
+                  {"metadataParts":[{"text":{"content":"Some Channel"}}]},
+                  {"metadataParts":[{"text":{"content":"1.2M views"}},{"text":{"content":"3 years ago"}}]}]}}}}}},
+            {"lockupViewModel":{"contentId":"PLxxxxxxxxx","contentType":"LOCKUP_CONTENT_TYPE_PLAYLIST"}},
+            {"shortsLockupViewModel":{"onTap":{"innertubeCommand":{"reelWatchEndpoint":{"videoId":"zyxwvutsrqp"}}},
+              "overlayMetadata":{"primaryText":{"content":"A short"},"secondaryText":{"content":"4M views"}}}}
+        ]}"#,
+        )
+        .unwrap();
+        let mut videos = Vec::new();
+        collect_videos(&json, &mut videos);
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].id, "abcdefghijk");
+        assert_eq!(videos[0].title, "A mature title");
+        assert_eq!(videos[0].channel, "Some Channel");
+        assert_eq!(videos[0].duration, "12:34");
+        assert_eq!(videos[0].views, "1.2M views");
+        assert_eq!(videos[0].published, "3 years ago");
+        assert_eq!(videos[1].duration, "short");
+        assert_eq!(videos[1].views, "4M views");
     }
 
     #[test]

@@ -28,6 +28,12 @@ pub fn sanitize_filename(input: &str) -> String {
     name
 }
 
+pub fn origin(referer: &str) -> Option<String> {
+    let (scheme, rest) = referer.split_once("://")?;
+    let host = rest.split(['/', '?', '#']).next()?;
+    (!host.is_empty()).then(|| format!("{scheme}://{host}"))
+}
+
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
@@ -119,5 +125,15 @@ mod tests {
         assert_eq!(ago(0, 7_200), "2 hours ago");
         assert_eq!(ago(0, 86_400), "1 day ago");
         assert_eq!(ago(0, 2 * 31_536_000), "2 years ago");
+    }
+
+    #[test]
+    fn origins_come_from_referers() {
+        assert_eq!(
+            origin("https://xhamster.com/videos/a?x=1").as_deref(),
+            Some("https://xhamster.com")
+        );
+        assert_eq!(origin("https://a.b").as_deref(), Some("https://a.b"));
+        assert_eq!(origin("nope"), None);
     }
 }

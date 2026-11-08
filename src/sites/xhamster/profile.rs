@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use super::json::{array, count, decode_entities, dig, first_text, flag, text, tidy};
 use super::{gallery, initials};
 use crate::model::{Choice, Profile, Scope, Video};
+use crate::sites::json::{array, count, decode_entities, dig, first_text, flag, text, tidy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -374,7 +374,7 @@ fn videos_of(initials: &Value, total: Option<u64>) -> Vec<Video> {
     if !best.is_empty() {
         return best;
     }
-    super::json::find_array(
+    crate::sites::json::find_array(
         initials,
         "videoThumbProps",
         &[

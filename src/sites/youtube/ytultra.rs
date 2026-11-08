@@ -64,23 +64,18 @@ pub fn resolve(video_id: &str) -> Result<Resolved, String> {
         "url": format!("https://www.youtube.com/watch?v={video_id}")
     })
     .to_string();
-    let mut response = ureq::post(ENDPOINT)
-        .header("accept", "*/*")
-        .header("content-type", "application/json")
-        .header("lang", "en")
-        .header("nonce", nonce())
-        .header("origin", "https://www.ytultra.com")
-        .header("referer", "https://www.ytultra.com/")
-        .header("sign", SIGN)
-        .header("timestamp", millis().to_string())
-        .header("x-app-id", "2")
-        .header("user-agent", USER_AGENT)
-        .send(payload.as_str())
-        .map_err(|error| format!("stream lookup failed: {error}"))?;
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("stream lookup failed: {error}"))?;
+    let headers = [
+        ("accept", "*/*".to_string()),
+        ("lang", "en".to_string()),
+        ("nonce", nonce()),
+        ("origin", "https://www.ytultra.com".to_string()),
+        ("referer", "https://www.ytultra.com/".to_string()),
+        ("sign", SIGN.to_string()),
+        ("timestamp", millis().to_string()),
+        ("x-app-id", "2".to_string()),
+        ("user-agent", USER_AGENT.to_string()),
+    ];
+    let body = crate::sites::net::post(ENDPOINT, &headers, &payload, "stream lookup")?;
     let json: Value = serde_json::from_str(&body)
         .map_err(|_| "unexpected response from stream service".to_string())?;
     if json.get("code").and_then(Value::as_str) != Some("0000") {

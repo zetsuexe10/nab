@@ -1,17 +1,12 @@
-mod download;
-mod hls;
-mod hlsdl;
-mod layout;
-mod model;
-pub mod mux;
-mod photos;
-mod play;
+mod engine;
+mod kit;
 mod sites;
-mod source;
-#[cfg(test)]
-mod testserver;
 mod tui;
-mod util;
+
+use engine::{download, hls, hlsdl, http, mux, photos, play};
+#[cfg(test)]
+use kit::testserver;
+use kit::{layout, model, source, util};
 
 use std::env;
 use std::io::IsTerminal;
@@ -33,6 +28,7 @@ struct Args {
     limit: usize,
     player: Option<String>,
     theme: Option<tui::ThemeMode>,
+    format: Option<mux::Container>,
     site: Option<Site>,
     galleries: bool,
     list: bool,
@@ -71,8 +67,15 @@ fn run() -> Result<ExitCode, String> {
             Some(name) => Some(play::choose(Some(name))?),
             None => play::detect(),
         };
-        return tui::run(args.query, layout, player, args.theme, args.site)
-            .map(|_| ExitCode::SUCCESS);
+        return tui::run(
+            args.query,
+            layout,
+            player,
+            args.theme,
+            args.site,
+            args.format,
+        )
+        .map(|_| ExitCode::SUCCESS);
     }
     if args.query.trim().is_empty() {
         print_help();
@@ -178,6 +181,7 @@ fn run() -> Result<ExitCode, String> {
             audio: audio.remote(),
             title,
             id: target.id.clone(),
+            meta: sources.meta.as_deref().cloned().map(model::Meta::audio),
         }
     } else {
         let video = sources
@@ -186,8 +190,10 @@ fn run() -> Result<ExitCode, String> {
         Job::Video {
             video: video.remote(),
             audio: sources.audio_for(video).map(source::Stream::remote),
+            wrap: args.format,
             title,
             id: target.id.clone(),
+            meta: sources.meta.as_deref().cloned(),
         }
     };
     let dir = layout.dir(owner.folder(), job.folder());
@@ -207,6 +213,7 @@ fn parse_args() -> Result<Args, String> {
         limit: 20,
         player: None,
         theme: None,
+        format: None,
         site: None,
         galleries: false,
         list: false,
@@ -257,6 +264,15 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| format!("--site needs {}", Site::names()))?;
                 args.site = Some(
                     Site::parse(&value).ok_or_else(|| format!("--site needs {}", Site::names()))?,
+                );
+            }
+            "-f" | "--format" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| format!("--format needs {}", mux::Container::names()))?;
+                args.format = Some(
+                    mux::Container::parse(&value)
+                        .ok_or_else(|| format!("--format needs {}", mux::Container::names()))?,
                 );
             }
             "--theme" => {
@@ -331,6 +347,7 @@ options:
   -o, --out <dir>         output folder, default Downloads/Nab
       --site <name>       {sites} (ctrl-s switches in the picker)
       --player <name>     mpv or vlc, default whatever is installed
+  -f, --format <name>     mp4, webm or mkv for merged videos (ctrl-f cycles in the picker)
       --theme <mode>      auto, light or dark (ctrl-t cycles in the picker)
   -n, --limit <count>     search results to show (default 20)
   -l, --list              print results and exit

@@ -20,16 +20,46 @@ pub fn frames(video: bool, count: usize, seed: u8) -> Vec<Frame> {
         .collect()
 }
 
-fn stsd(video: bool) -> Vec<u8> {
+pub const AAC_CONFIG: [u8; 2] = [0x12, 0x10];
+pub const AVC_CONFIG: [u8; 8] = [1, 0x64, 0, 0x1f, 0xff, 0xe1, 0, 0];
+
+fn video_entry() -> Vec<u8> {
     let mut entry = Vec::new();
     entry.put_zeros(6);
     entry.put_u16(1);
-    entry.extend_from_slice(&[7u8; 20]);
-    let kind: &[u8; 4] = if video { b"avc1" } else { b"mp4a" };
+    entry.put_zeros(16);
+    entry.put_u16(320);
+    entry.put_u16(180);
+    entry.put_zeros(50);
+    entry.extend_from_slice(&atom(b"avcC", &AVC_CONFIG));
+    atom(b"avc1", &entry)
+}
+
+fn audio_entry() -> Vec<u8> {
+    let mut entry = Vec::new();
+    entry.put_zeros(6);
+    entry.put_u16(1);
+    entry.put_zeros(8);
+    entry.put_u16(2);
+    entry.put_u16(16);
+    entry.put_u32(0);
+    entry.put_u32(44100 << 16);
+    let mut decoder = vec![0x40];
+    decoder.extend_from_slice(&[0x15; 1]);
+    decoder.put_zeros(11);
+    decoder.extend_from_slice(&[0x05, 0x02]);
+    decoder.extend_from_slice(&AAC_CONFIG);
+    let mut descriptors = vec![0x03, 0x16, 0, 1, 0, 0x04, decoder.len() as u8];
+    descriptors.extend_from_slice(&decoder);
+    entry.extend_from_slice(&full(b"esds", 0, 0, &descriptors));
+    atom(b"mp4a", &entry)
+}
+
+fn stsd(video: bool) -> Vec<u8> {
     full(b"stsd", 0, 0, &{
         let mut body = Vec::new();
         body.put_u32(1);
-        body.extend_from_slice(&atom(kind, &entry));
+        body.extend_from_slice(&if video { video_entry() } else { audio_entry() });
         body
     })
 }

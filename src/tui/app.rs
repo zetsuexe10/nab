@@ -13,6 +13,7 @@ use super::theme::ThemeMode;
 use crate::download::{self, Job, Msg, Remote, Stage};
 use crate::layout::{Folder, Layout};
 use crate::model::{Comment, CommentPage, Media, Profile, Scope, Video};
+use crate::mux::Container;
 use crate::play::{self, Player};
 use crate::sites::{self, Cursor, Entry, Page, Site, Suggestion};
 use crate::source::{Kind, Sources, Stream};
@@ -174,6 +175,7 @@ pub struct App {
     pub notice: Option<(String, Instant)>,
     pub layout: Layout,
     pub theme: ThemeMode,
+    pub format: Option<Container>,
     pub history: Vec<String>,
     pub recall: Option<usize>,
     pub draft: String,
@@ -247,6 +249,7 @@ impl App {
             notice: None,
             layout,
             theme: ThemeMode::Auto,
+            format: None,
             history: Vec::new(),
             recall: None,
             draft: String::new(),
@@ -272,6 +275,7 @@ impl App {
             if let Some(site) = store.site() {
                 self.site = site;
             }
+            self.format = store.format();
         }
         self.store = store;
         self
@@ -280,6 +284,13 @@ impl App {
     pub fn with_theme(mut self, theme: Option<ThemeMode>) -> Self {
         if let Some(theme) = theme {
             self.theme = theme;
+        }
+        self
+    }
+
+    pub fn with_format(mut self, format: Option<Container>) -> Self {
+        if format.is_some() {
+            self.format = format;
         }
         self
     }
@@ -678,7 +689,11 @@ impl App {
                     from,
                 };
                 self.trail.push(held);
-                self.related_of = Some(video.title.clone()).filter(|title| !title.is_empty());
+                self.related_of = Some(if video.title.is_empty() {
+                    "Related".to_string()
+                } else {
+                    format!("Related to {}", video.title)
+                });
                 self.results = page.videos;
                 self.cursor = page.cursor;
                 self.sel = 0;
@@ -708,6 +723,47 @@ impl App {
             _ => Mode::Results,
         };
         true
+    }
+
+    fn open_cast(&mut self) {
+        let (Some(video), Some(sources)) = (self.current.clone(), self.sources.clone()) else {
+            return;
+        };
+        let rows: Vec<Video> = sources
+            .cast
+            .iter()
+            .filter(|credit| credit.is_person())
+            .map(|credit| credit.item(video.site))
+            .collect();
+        match rows.len() {
+            0 => self.tell("no performers listed"),
+            1 => {
+                let site = Site::named(video.site).unwrap_or(self.site);
+                let url = rows[0].author_url.clone().unwrap_or_default();
+                self.open_profile(site, url, "featured", Scope::Videos, 1, Mode::Formats);
+            }
+            _ => {
+                let from = self.formats_from;
+                let held = Trail {
+                    results: std::mem::take(&mut self.results),
+                    sel: self.sel,
+                    rscroll: self.rscroll,
+                    cursor: self.cursor.take(),
+                    from,
+                };
+                self.trail.push(held);
+                let title = if video.title.is_empty() {
+                    "video".to_string()
+                } else {
+                    video.title.clone()
+                };
+                self.related_of = Some(format!("Cast of {title}"));
+                self.results = rows;
+                self.sel = 0;
+                self.rscroll = 0;
+                self.mode = Mode::Results;
+            }
+        }
     }
 
     fn open_comments(&mut self, video: Option<Video>, back: Mode) {
@@ -955,6 +1011,25 @@ impl App {
         }
     }
 
+    pub fn format_label(&self) -> &'static str {
+        self.format.map_or("native", Container::extension)
+    }
+
+    fn cycle_format(&mut self) {
+        self.format = match self.format {
+            None => Some(Container::Mkv),
+            Some(Container::Mkv) => Some(Container::Mp4),
+            Some(_) => None,
+        };
+        if let Some(store) = &self.store {
+            store.save_format(self.format);
+        }
+        self.tell(format!(
+            "merged videos are saved as {}",
+            self.format_label()
+        ));
+    }
+
     fn reset(&mut self) {
         self.query.clear();
         self.caret = 0;
@@ -982,6 +1057,10 @@ impl App {
         }
         if control && key.code == KeyCode::Char('t') {
             self.cycle_theme();
+            return Flow::Continue;
+        }
+        if control && key.code == KeyCode::Char('f') {
+            self.cycle_format();
             return Flow::Continue;
         }
         self.notice = None;
@@ -1364,6 +1443,7 @@ impl App {
                 let from = self.formats_from;
                 self.open_related(video, from);
             }
+            KeyCode::Char('a') => self.open_cast(),
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
                 self.mode = match self.formats_from {
                     Mode::Profile if self.profile.is_some() => Mode::Profile,
@@ -1602,12 +1682,19 @@ impl App {
                     audio: stream.remote(),
                     title,
                     id,
+                    meta: sources
+                        .meta
+                        .as_deref()
+                        .cloned()
+                        .map(crate::model::Meta::audio),
                 },
                 Kind::Video | Kind::Muxed => Job::Video {
                     video: stream.remote(),
                     audio: pair,
+                    wrap: self.format,
                     title,
                     id,
+                    meta: sources.meta.as_deref().cloned(),
                 },
                 Kind::Gallery => return Flow::Continue,
             };
@@ -2349,5 +2436,30 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.results.len(), before);
         assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[test]
+    fn cast_opens_as_profile_rows_and_one_performer_opens_directly() {
+        use crate::source::Credit;
+        let mut app = sample();
+        app.current = Some(Video::stub("7"));
+        app.current.as_mut().unwrap().site = "xhamster";
+        let credit = |name: &str| Credit {
+            name: name.to_string(),
+            url: format!("https://xhamster.com/pornstars/{name}"),
+            kind: "pornstar",
+        };
+        app.sources.as_mut().unwrap().cast = vec![credit("amy"), credit("bea")];
+        app.mode = Mode::Formats;
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Results);
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.results[0].media, Media::Person);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.related_of.is_none());
+        app.mode = Mode::Formats;
+        app.sources.as_mut().unwrap().cast = vec![credit("amy")];
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.mode, Mode::Busy);
     }
 }

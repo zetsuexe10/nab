@@ -1,5 +1,5 @@
 use crate::download::Remote;
-use crate::model::{Photo, Video};
+use crate::model::{Meta, Photo, Video};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -41,12 +41,51 @@ impl Stream {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Credit {
+    pub name: String,
+    pub url: String,
+    pub kind: &'static str,
+}
+
+impl Credit {
+    pub fn is_person(&self) -> bool {
+        matches!(
+            self.kind,
+            "pornstar" | "celebrity" | "creator" | "channel" | "user"
+        )
+    }
+
+    pub fn item(&self, site: &'static str) -> Video {
+        Video {
+            id: self
+                .url
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            title: self.name.clone(),
+            channel: self.kind.to_string(),
+            url: Some(self.url.clone()),
+            author_url: Some(self.url.clone()),
+            media: crate::model::Media::Person,
+            site,
+            ..Video::default()
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
+    pub cast: Vec<Credit>,
+    pub tags: Vec<Credit>,
+    pub rating: Option<String>,
     pub title: Option<String>,
     pub streams: Vec<Stream>,
     pub detail: Option<Video>,
     pub photos: Vec<Photo>,
+    pub meta: Option<Box<Meta>>,
     pub preferred: Option<&'static str>,
 }
 
@@ -63,6 +102,18 @@ impl Sources {
         }
         if self.photos.is_empty() {
             self.photos = other.photos;
+        }
+        if self.meta.is_none() {
+            self.meta = other.meta;
+        }
+        if self.cast.is_empty() {
+            self.cast = other.cast;
+        }
+        if self.tags.is_empty() {
+            self.tags = other.tags;
+        }
+        if self.rating.is_none() {
+            self.rating = other.rating;
         }
         for stream in other.streams {
             if stream.url.is_empty() {

@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use super::INNERTUBE;
+use super::{tags, INNERTUBE};
 use crate::source::{Kind, Sources, Stream};
 
 const KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
@@ -95,23 +95,17 @@ fn client() -> Value {
 fn post(name: &str, body: &Value, visitor: Option<&str>) -> Result<String, String> {
     let endpoint =
         format!("https://www.youtube.com/youtubei/v1/{name}?key={KEY}&prettyPrint=false");
-    let mut request = ureq::post(endpoint.as_str())
-        .header("content-type", "application/json")
-        .header("origin", "https://www.youtube.com")
-        .header("referer", "https://www.youtube.com/")
-        .header("user-agent", USER_AGENT)
-        .header("x-youtube-client-name", "101")
-        .header("x-youtube-client-version", "1.02");
+    let mut headers = vec![
+        ("origin", "https://www.youtube.com".to_string()),
+        ("referer", "https://www.youtube.com/".to_string()),
+        ("user-agent", USER_AGENT.to_string()),
+        ("x-youtube-client-name", "101".to_string()),
+        ("x-youtube-client-version", "1.02".to_string()),
+    ];
     if let Some(visitor) = visitor {
-        request = request.header("x-goog-visitor-id", visitor);
+        headers.push(("x-goog-visitor-id", visitor.to_string()));
     }
-    let mut response = request
-        .send(body.to_string())
-        .map_err(|error| format!("stream lookup failed: {error}"))?;
-    response
-        .body_mut()
-        .read_to_string()
-        .map_err(|error| format!("stream lookup failed: {error}"))
+    crate::sites::net::post(&endpoint, &headers, &body.to_string(), "stream lookup")
 }
 
 fn parse(json: &Value) -> Result<Sources, String> {
@@ -139,8 +133,13 @@ fn parse(json: &Value) -> Result<Sources, String> {
     let streaming = json
         .get("streamingData")
         .ok_or_else(|| "youtube returned no streams".to_string())?;
+    let id = json
+        .pointer("/videoDetails/videoId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let mut built = Sources {
         title,
+        meta: tags::from_player(json, id).map(Box::new),
         streams: Vec::new(),
         preferred: Some(INNERTUBE),
         ..Sources::default()

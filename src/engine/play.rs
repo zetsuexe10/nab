@@ -119,6 +119,9 @@ fn mpv_args(
     ];
     if let Some(referer) = referer {
         args.push(os(format!("--referrer={referer}")));
+        if let Some(origin) = crate::util::origin(referer) {
+            args.push(os(format!("--http-header-fields=Origin: {origin}")));
+        }
     }
     match (video, audio) {
         (Some(video), Some(audio)) => {
@@ -258,8 +261,10 @@ fn play_merged(
     let job = Job::Video {
         video: video.clone(),
         audio: Some(audio.clone()),
+        wrap: None,
         title: title.to_string(),
         id: "play".to_string(),
+        meta: None,
     };
     let merged = download::run_blocking(job, dir).map_err(|_| Fallback::Unavailable)?;
     let args = file_args(Player::Vlc, &merged, true);

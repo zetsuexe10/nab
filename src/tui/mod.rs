@@ -154,13 +154,15 @@ pub fn run(
     player: Option<Player>,
     theme: Option<theme::ThemeMode>,
     site: Option<Site>,
+    format: Option<crate::mux::Container>,
 ) -> Result<(), String> {
     install_panic_hook();
     let terminal = setup()?;
     let mut app = App::new(query, layout, player)
         .with_store(store::Store::locate())
         .with_theme(theme)
-        .with_site(site);
+        .with_site(site)
+        .with_format(format);
     app.watch_clipboard();
     app.submit();
     let outcome = event_loop(terminal, app);

@@ -3,6 +3,8 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use super::bytes::{truncated, write_failed, Put, Res, Window};
+use super::mtags;
+use crate::model::Meta;
 
 const EBML: u32 = 0x1A45_DFA3;
 const SEGMENT: u32 = 0x1853_8067;
@@ -39,8 +41,8 @@ const DOC_TYPE: u32 = 0x4282;
 
 const MAX_CLUSTER_MS: i64 = 10_000;
 const MAX_ELEMENT: u64 = 1 << 28;
-const VIDEO: u8 = 1;
-const AUDIO: u8 = 2;
+pub(super) const VIDEO: u8 = 1;
+pub(super) const AUDIO: u8 = 2;
 
 struct Header {
     id: u32,
@@ -115,29 +117,45 @@ fn is_top_level(id: u32) -> bool {
     )
 }
 
-struct Entry {
-    number: u64,
-    kind: u8,
-    fields: Vec<Vec<u8>>,
+pub(super) struct Entry {
+    pub number: u64,
+    pub kind: u8,
+    pub fields: Vec<Vec<u8>>,
 }
 
-struct Block {
-    track: u64,
-    time: i64,
-    flags: u8,
-    keyframe: bool,
-    data: u64,
-    len: u32,
-    extra: Vec<u8>,
-    grouped: bool,
+pub(super) struct Block {
+    pub track: u64,
+    pub time: i64,
+    pub decode: i64,
+    pub flags: u8,
+    pub keyframe: bool,
+    pub data: u64,
+    pub len: u32,
+    pub extra: Vec<u8>,
+    pub grouped: bool,
 }
 
-struct Part {
-    reader: Window,
-    entry: Entry,
-    blocks: Vec<Block>,
-    scale: u64,
-    duration_ns: f64,
+pub(super) struct Part {
+    pub reader: Window,
+    pub entry: Entry,
+    pub blocks: Vec<Block>,
+    pub scale: u64,
+    pub duration_ns: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Doc {
+    WebM,
+    Matroska,
+}
+
+impl Doc {
+    fn name(self) -> &'static [u8] {
+        match self {
+            Doc::WebM => b"webm",
+            Doc::Matroska => b"matroska",
+        }
+    }
 }
 
 fn put_id(out: &mut Vec<u8>, id: u32) {
@@ -169,7 +187,7 @@ pub(super) fn uint_element(id: u32, value: u64) -> Vec<u8> {
     element(id, &bytes[skip..])
 }
 
-fn float_element(id: u32, value: f64) -> Vec<u8> {
+pub(super) fn float_element(id: u32, value: f64) -> Vec<u8> {
     element(id, &value.to_be_bytes())
 }
 
@@ -362,6 +380,7 @@ fn scan_cluster(
                 blocks.push(Block {
                     track,
                     time: stamp + relative as i64,
+                    decode: stamp + relative as i64,
                     flags,
                     keyframe: flags & 0x80 != 0,
                     data,
@@ -405,6 +424,7 @@ fn scan_cluster(
                     blocks.push(Block {
                         track,
                         time: stamp + relative as i64,
+                        decode: stamp + relative as i64,
                         flags,
                         keyframe,
                         data,
@@ -421,7 +441,7 @@ fn scan_cluster(
     Ok(end)
 }
 
-fn demux(path: &Path, kind: u8) -> Res<Part> {
+pub(super) fn demux(path: &Path, kind: u8) -> Res<Part> {
     let mut reader = Window::open(path)?;
     let scanned = scan(&mut reader)?;
     let wanted = if kind == VIDEO { "video" } else { "audio" };
@@ -462,6 +482,7 @@ struct Planned {
     part: usize,
     index: usize,
     ms: i64,
+    sort: i64,
 }
 
 fn flat(parts: &[Part]) -> Vec<Planned> {
@@ -472,10 +493,11 @@ fn flat(parts: &[Part]) -> Vec<Planned> {
                 part: part_index,
                 index,
                 ms: to_ms(block.time, part.scale),
+                sort: to_ms(block.decode, part.scale),
             });
         }
     }
-    all.sort_by_key(|planned| planned.ms);
+    all.sort_by_key(|planned| planned.sort);
     all
 }
 
@@ -513,8 +535,45 @@ fn block_bytes(part: &mut Part, index: usize, number: u64, relative: i16) -> Res
     Ok(element(BLOCK_GROUP, &group))
 }
 
-pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
-    let mut parts = vec![demux(video, VIDEO)?, demux(audio, AUDIO)?];
+pub fn merge(video: &Path, audio: &Path, out: &Path, doc: Doc, meta: Option<&Meta>) -> Res<()> {
+    write(
+        vec![demux(video, VIDEO)?, demux(audio, AUDIO)?],
+        out,
+        doc,
+        meta,
+    )
+}
+
+pub fn extract_audio(source: &Path, out: &Path, doc: Doc, meta: Option<&Meta>) -> Res<()> {
+    write(vec![demux(source, AUDIO)?], out, doc, meta)
+}
+
+pub fn retag(source: &Path, out: &Path, doc: Doc, meta: &Meta) -> Res<()> {
+    let parts: Vec<Part> = [VIDEO, AUDIO]
+        .into_iter()
+        .filter_map(|kind| demux(source, kind).ok())
+        .collect();
+    if parts.is_empty() {
+        return Err("no audio or video track found".to_string());
+    }
+    write(parts, out, doc, Some(meta))
+}
+
+pub(super) fn write(mut parts: Vec<Part>, out: &Path, doc: Doc, meta: Option<&Meta>) -> Res<()> {
+    let tags = meta.map(mtags::tags).unwrap_or_default();
+    let attached = match (doc, meta) {
+        (Doc::Matroska, Some(meta)) => mtags::attachments(meta),
+        _ => Vec::new(),
+    };
+    let mut ids = vec![INFO, TRACKS];
+    if !tags.is_empty() {
+        ids.push(TAGS);
+    }
+    if !attached.is_empty() {
+        ids.push(ATTACHMENTS);
+    }
+    ids.push(CUES);
+    let has_video = parts.iter().any(|part| part.entry.kind == VIDEO);
     let order = flat(&parts);
     let file = File::create(out).map_err(|error| format!("cannot write output: {error}"))?;
     let mut writer = BufWriter::with_capacity(1 << 20, file);
@@ -523,7 +582,7 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
     ebml.extend_from_slice(&uint_element(0x42F7, 1));
     ebml.extend_from_slice(&uint_element(0x42F2, 4));
     ebml.extend_from_slice(&uint_element(0x42F3, 8));
-    ebml.extend_from_slice(&element(DOC_TYPE, b"webm"));
+    ebml.extend_from_slice(&element(DOC_TYPE, doc.name()));
     ebml.extend_from_slice(&uint_element(0x4287, 4));
     ebml.extend_from_slice(&uint_element(0x4285, 2));
     head.extend_from_slice(&element(EBML, &ebml));
@@ -533,7 +592,7 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
     let segment_start = head.len() as u64;
     writer.write_all(&head).map_err(write_failed)?;
 
-    let info_pos = seek_head(0, 0, 0).len() as u64;
+    let info_pos = seek_head(&ids, &vec![0; ids.len()]).len() as u64;
     let last = order.last().map(|planned| planned.ms).unwrap_or(0);
     let source_ms = parts
         .iter()
@@ -550,12 +609,24 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
     }
     let tracks = element(TRACKS, &tracks);
     let tracks_pos = info_pos + info.len() as u64;
-    let after_tracks = tracks_pos + tracks.len() as u64;
+    let tags_pos = tracks_pos + tracks.len() as u64;
+    let attached_pos = tags_pos + tags.len() as u64;
+    let after_tracks = attached_pos + attached.len() as u64;
+    let mut places = vec![info_pos, tracks_pos];
+    if !tags.is_empty() {
+        places.push(tags_pos);
+    }
+    if !attached.is_empty() {
+        places.push(attached_pos);
+    }
+    places.push(0);
     writer
-        .write_all(&seek_head(info_pos, tracks_pos, 0))
+        .write_all(&seek_head(&ids, &places))
         .map_err(write_failed)?;
     writer.write_all(&info).map_err(write_failed)?;
     writer.write_all(&tracks).map_err(write_failed)?;
+    writer.write_all(&tags).map_err(write_failed)?;
+    writer.write_all(&attached).map_err(write_failed)?;
 
     let mut position = after_tracks;
     let mut cues: Vec<(i64, u64)> = Vec::new();
@@ -571,7 +642,7 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
             let planned = &order[at];
             let part = &parts[planned.part];
             let block = &part.blocks[planned.index];
-            let video_key = planned.part == 0 && block.keyframe;
+            let video_key = part.entry.kind == VIDEO && block.keyframe;
             let relative = planned.ms - base;
             if !first
                 && (video_key
@@ -595,7 +666,7 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
             first = false;
             at += 1;
         }
-        if keyed {
+        if keyed || !has_video {
             cues.push((key_time, position));
         }
         let cluster = element(CLUSTER, &body);
@@ -623,14 +694,17 @@ pub fn merge(video: &Path, audio: &Path, out: &Path) -> Res<()> {
         .map_err(write_failed)?;
     file.seek(SeekFrom::Start(segment_start))
         .map_err(write_failed)?;
-    file.write_all(&seek_head(info_pos, tracks_pos, cues_pos))
+    if let Some(last) = places.last_mut() {
+        *last = cues_pos;
+    }
+    file.write_all(&seek_head(&ids, &places))
         .map_err(write_failed)?;
     file.flush().map_err(write_failed)
 }
 
-fn seek_head(info: u64, tracks: u64, cues: u64) -> Vec<u8> {
+fn seek_head(ids: &[u32], places: &[u64]) -> Vec<u8> {
     let mut body = Vec::new();
-    for (id, position) in [(INFO, info), (TRACKS, tracks), (CUES, cues)] {
+    for (id, position) in ids.iter().copied().zip(places.iter().copied()) {
         let mut name = Vec::new();
         put_id(&mut name, id);
         let mut entry = element(SEEK_ID, &name);

@@ -1,8 +1,8 @@
 # nab
 
 Search YouTube or xHamster from the terminal, pick a stream, and nab it. One small Rust binary:
-a full-screen picker, audio or video saved under clean names, and playback through
-mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
+a full-screen picker, audio, video and photo galleries saved under clean names, and playback
+through mpv or vlc. Merging, remuxing and audio extraction are built in.
 
 ```
                          █▄ █ ▄▀▀▄ █▀▀▄
@@ -10,12 +10,13 @@ mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
                          ▀  ▀ ▀  ▀ ▀▀▀
 
                 search youtube, pick a stream, nab it
+     audio · video · galleries · mpv · vlc · saves as native
 
    ╭─ Search or paste a link ──────────────────────────▄▄▄▄▄▄▄
    │ ❯ lofi beats to study to                            nab
    ╰───────────────────────────────────────────────────▀▀▀▀▀▀▀
 
-     ↵ search  ·  ↑ history  ·  esc quit  ·  ^c quit  ·  ^t theme:auto
+     ↵ search  ·  ↑ history  ·  esc quit  ·  ^c quit  ·  ^t theme:auto  ·  ^f save:native
 ```
 
 ## Features
@@ -34,10 +35,14 @@ mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
 - Videos, audio only, and photo galleries, each filed into its own folder per site
   (see [Files](#files)). Audio works on every site: where a site has no audio-only
   stream, nab takes the sound track out of the smallest video it can find.
-- Audio or video in any offered quality, saved as `Title.m4a` or `Title.mp4`.
+- Audio or video in any offered quality, saved as `Title.m4a` or `Title.mp4`, or wrapped
+  in Matroska (`Title.mkv`, `Title.mka`) when you ask for it with `ctrl+f` or `--format`.
 - Modular: a site is one module that implements the `Provider` trait plus a line in the
   registry (see [Adding a site](#adding-a-site)).
-- Video and audio are merged by nab's own muxer, so nothing else needs installing.
+- Video and audio are merged by nab's own muxer (MP4, WebM and Matroska), so nothing else
+  needs installing.
+- YouTube downloads are tagged: title, artist, album, album artist, composer, release date,
+  description, source link and the thumbnail as cover art (see [Metadata](#metadata)).
 - mpv and vlc are both first-class: pick either one per play, with a key or a flag.
 - Fast downloads: ranged requests, fetched as parallel segments.
 - Scriptable: every action also works from flags, with the saved path on stdout.
@@ -47,13 +52,13 @@ mpv or vlc. No ffmpeg, no yt-dlp, no cookies.
 From source:
 
 ```bash
-cargo install --git https://github.com/zetsuexe10/snag --locked
+cargo install --git https://github.com/zetsuexe10/nab --locked
 ```
 
 Or clone and build:
 
 ```bash
-gh repo clone zetsuexe10/snag
+gh repo clone zetsuexe10/nab
 cd nab
 cargo install --path . --locked
 ```
@@ -62,7 +67,7 @@ Release binaries are attached to every tag: static `x86_64` and `aarch64` Linux 
 and Windows in 64-bit (`x86_64-pc-windows-msvc`) and 32-bit (`i686-pc-windows-msvc`).
 
 ```bash
-gh release download --repo zetsuexe10/snag \
+gh release download --repo zetsuexe10/nab \
   --pattern 'nab-x86_64-unknown-linux-musl.tar.gz' \
   --dir /tmp/nab
 tar -xzf /tmp/nab/nab-x86_64-unknown-linux-musl.tar.gz -C ~/.local/bin
@@ -71,7 +76,7 @@ tar -xzf /tmp/nab/nab-x86_64-unknown-linux-musl.tar.gz -C ~/.local/bin
 On Linux the helper script picks the right archive for you:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zetsuexe10/snag/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zetsuexe10/nab/master/install.sh | bash
 ```
 
 ## Use
@@ -90,6 +95,7 @@ nab https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | search | `↑` `↓` | with no suggestions open, walk through earlier searches or jump to the results |
 | search | `tab` | fill the highlighted suggestion, paste the clipboard link, or jump to the results |
 | search | `ctrl+s` | switch between YouTube and xHamster |
+| search | `ctrl+f` | cycle the container for merged videos: native, mkv, mp4 |
 | search | `ctrl+g` | switch what you search: videos, galleries, stars (where the site has them) |
 | search | `←` `→` `home` `end` | move the cursor |
 | search | `ctrl+u` `ctrl+w` `ctrl+k` | clear, delete word, delete to end |
@@ -115,12 +121,14 @@ nab https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | formats | `tab` | switch source (innertube, ytultra, initials, page source) |
 | formats | `o` | open the uploader's profile |
 | formats | `c` / `r` | comments / related videos |
+| formats | `a` | open the cast and channels as profile rows (one performer opens directly) |
 | formats | `esc` | back |
 | download | `esc` | cancel (not while merging or extracting audio) |
 | done | `enter` | nab another |
 | done | `p` `m` `v` | play the saved file |
 | done | `esc` | back to the formats |
 | anywhere | `ctrl+t` | cycle the theme: auto, light, dark |
+| anywhere | `ctrl+f` | cycle the container for merged videos: native, mkv, mp4 |
 | anywhere | `ctrl+c` | quit |
 
 Clicking does what the matching key does: the `nab` button submits, a row opens, a hint
@@ -131,7 +139,7 @@ without a new search. The Download panel lists videos first and then audio, each
 size. The line next to it says whether a video gets a matching audio track merged in or is
 ready as is.
 
-The theme, the site and the search history are remembered in `~/.config/nab` (`%APPDATA%\nab` on
+The theme, the site, the container and the search history are remembered in `~/.config/nab` (`%APPDATA%\nab` on
 Windows). `NAB_CONFIG_DIR` moves that folder and `--theme auto|light|dark` overrides the
 theme for one run. `auto` uses your terminal's own colours.
 
@@ -142,6 +150,7 @@ nab --list "koyaanisqatsi"                       # print results
 nab --audio "koyaanisqatsi"                      # save the first result as m4a
 nab --video "koyaanisqatsi"                      # save the first result as mp4
 nab --video --quality 480p "koyaanisqatsi"       # pick a height
+nab --video --format mkv "koyaanisqatsi"        # merge into Matroska
 nab --play "koyaanisqatsi"                       # listen now, no file
 nab --play --video --player vlc "koyaanisqatsi"  # watch now, in vlc
 nab --site xhamster --list "some query"          # search the other site
@@ -160,11 +169,17 @@ The saved path is printed on stdout, progress on stderr.
 | `-q`, `--quality <height>` | 144p, 240p, 360p, 480p, 720p and up |
 | `-p`, `--play` | play instead of saving |
 | `--player <name>` | `mpv` or `vlc` |
+| `-f`, `--format <name>` | container for merged videos: `mp4`, `webm` or `mkv` |
 | `--site <name>` | `youtube` or `xhamster` |
 | `--theme <mode>` | `auto`, `light` or `dark` |
 | `-o`, `--out <dir>` | output root, default `Downloads/Nab` |
 | `-n`, `--limit <count>` | results to show, default 20 |
 | `-l`, `--list` | print results and exit |
+
+## Troubleshooting
+
+- xHamster media needs a Referer, and nab sends the site's Referer and Origin on every request: downloads, HLS segments, photos, and what it hands to mpv and vlc.
+- YouTube search reads both the classic and the newer lockup result formats and asks with safe search off, so mature queries list normally. Age-restricted videos can still refuse to resolve without a signed-in session.
 
 ## Players
 
@@ -210,22 +225,74 @@ fails only if none could be saved. Temporary parts are removed on failure or can
 
 ## Muxer
 
-`src/mux` is a small pure-Rust muxer that joins one video track and one audio track into a
-single file. Samples are copied byte for byte, nothing is re-encoded.
+`src/engine/mux` is a small pure-Rust muxer that joins one video track and one audio track
+into a single file. Samples are copied byte for byte, nothing is re-encoded.
 
-| Container | Video | Audio |
-| --- | --- | --- |
-| MP4 (fragmented or regular) | h264, hevc, av1 | aac |
-| WebM | vp9, av1 | opus, vorbis |
+| Container | Video | Audio | Extensions |
+| --- | --- | --- | --- |
+| MP4 (fragmented or regular) | h264, hevc, av1 | aac | `.mp4` `.m4a` |
+| WebM | vp9, av1 | opus, vorbis | `.webm` `.weba` |
+| Matroska | everything WebM holds, plus h264, hevc, av1 remuxed from MP4 | opus, vorbis, aac | `.mkv` `.mka` |
 
 - MP4 output is progressive with the index up front, so it starts playing and seeks
   without scanning. Offsets switch to 64-bit past 4 GB.
-- WebM output carries a seek head and cues for every video keyframe.
-- Edit lists, composition offsets, start offsets and rotation are preserved, so audio and
-  video stay in sync.
+- WebM and Matroska output carry a seek head and cues, and Matroska keeps frames in decode
+  order so B-frame video from MP4 plays correctly.
+- Remuxing: an MP4 pair (h264, hevc or av1 with aac) can be written as Matroska, and a WebM
+  pair can be written as Matroska. Going the other way is refused, and nab saves the
+  native container and says so.
+- Audio extraction works on MP4 (`.m4a`), WebM (`.weba`) and Matroska (`.mka`), and an MP4
+  can be cut into `.mka`.
+- Edit lists, composition offsets, start offsets and rotation are preserved in MP4, so
+  audio and video stay in sync.
 - Truncated or corrupt input is reported as an error instead of producing a broken file.
 - A video is paired with audio of the same container: `mp4` with `m4a`, `webm` with
-  `weba`. If no matching audio exists, the video is saved alone and nab says so.
+  `weba`, `mkv` with `mka`. If no matching audio exists, the video is saved alone and nab
+  says so.
+
+## Metadata
+
+YouTube audio and video are tagged as they are saved. The tags come from the same player
+response nab already fetches for the streams, and the cover is the largest thumbnail
+(falling back to `maxresdefault.jpg`, then `hqdefault.jpg`).
+
+| Tag | Source |
+| --- | --- |
+| title | the video title, or the track title on auto-generated music uploads |
+| artist | the channel name (`- Topic` removed), or every artist credited on a music upload |
+| album, album artist, composer | the "Provided to YouTube by" description that music uploads carry |
+| date | the release date on music uploads, otherwise the publish date |
+| comment | the video description (up to 2000 characters) and the watch link |
+| cover | the thumbnail, embedded as cover art |
+
+- `.m4a` and `.mp4` get iTunes-style atoms (`©nam`, `©ART`, `aART`, `©alb`, `©day`,
+  `©wrt`, `©cmt`, `trkn`, `covr`), and `.mkv` and `.mka` get Matroska tags plus an
+  attached `cover.jpg`. `.webm` and `.weba` get the tags but no cover, because WebM has no
+  attachments.
+- For audio, a title written as `Artist - Song` is split into artist and title when the
+  upload has no album information.
+- Files saved straight from YouTube (an `.m4a`, `.weba` or a muxed `.mp4`) are rewritten
+  through the muxer to add the tags, so fragmented audio comes out as a regular file.
+- Tagging never fails a download. If a file cannot be tagged, or no cover can be fetched,
+  nab saves what it has and says so.
+- Track numbers are written when known, but a single YouTube video does not carry one, so
+  they are normally left empty.
+- Tagging applies to YouTube only. HLS streams (`.ts`) and xHamster downloads are saved
+  untagged.
+
+## Downloads
+
+Every transfer goes through one HTTP layer (`engine/http.rs`) that sends the user agent,
+the site's Referer and Origin, and retries a failed range or segment up to three times
+before giving up. Progress is rolled back when an attempt fails, so the bar never runs
+past 100%.
+
+- Direct files use ranged requests; anything over 4 MB is fetched as parallel segments
+  and checked against its declared size.
+- HLS playlists are resolved to the tallest variant, fetched as parallel segments and
+  joined in order. Transport streams are saved as `.ts`, fragmented mp4 as `.mp4` with
+  the init segment first. AES-encrypted playlists are refused with a clear message.
+- Galleries fetch four photos at a time.
 
 ## How it finds streams
 
@@ -261,6 +328,7 @@ instead, so one still works when the other breaks.
 - Geo-blocked and removed videos are reported as such.
 - Uploader (`/users/…`) profiles read their videos from the `/videos` tab and page by number; the hero details come from the landing page.
 - Related videos use `/api/front/video/related` and page on as you scroll. Comments come from the site's `/x-api` call and load page by page.
+- The formats side panel lists the video's rating, cast, channel and tags. Video searches also put matching people (creators from the results page and the suggest API) on top, so a name like "sweetie fox" gives you the profile as well as the videos.
 - Stars: `ctrl+g` to the stars scope lists the pornstar directory (type `creators`, `channels` or `celebrities` for the others) or searches stars by name; `enter` opens a profile.
 - xHamster has no audio-only stream, so `Audios` is filled by cutting the sound track
   out of the smallest progressive mp4 (the smallest HLS stream when there is none), with
@@ -273,18 +341,25 @@ instead, so one still works when the other breaks.
 ```
 src/
   main.rs          flags and non-interactive mode
-  model.rs         Video, Profile, Photo, Scope and the other shared types
-  layout.rs        output folders per OS, site and kind
-  source.rs        merged stream list and ranking
-  download.rs      ranged downloads, audio extraction, merge step, file naming
-  photos.rs        parallel gallery downloads
-  hls.rs hlsdl.rs  playlist parsing, segment download and join
-  mux/             mp4 and webm muxer, audio extraction
-  play.rs          mpv and vlc discovery and launching
-  sites/
+  kit/             what every part shares
+    model.rs       Video, Profile, Photo, Comment, Meta, Scope and the other types
+    source.rs      streams, credits, merged ranking
+    layout.rs      output folders per OS, site and kind
+    util.rs        sizes, durations, origins
+  engine/          doing the work, knows nothing about any site
+    http.rs        requests, referer and origin, streaming copy, retries
+    download.rs    ranged downloads, audio extraction, merge step, tagging, naming
+    hls.rs         playlist parsing
+    hlsdl.rs       parallel segment download and join
+    photos.rs      parallel gallery downloads
+    mux/           mp4, webm and matroska muxer, remuxing, audio extraction, tag writers
+    play.rs        mpv and vlc discovery and launching
+  sites/           one folder per site, plus what they share
     mod.rs         Provider trait, registry, link and query classification
-    youtube/       search, innertube, ytultra
-    xhamster/      cipher, initials, page scraper, sources, profiles, galleries, suggestions
+    net.rs         HTTP with retries, JSON posts, url encoding
+    json.rs        tolerant lookups into page data
+    youtube/       search, innertube, tags, ytultra
+    xhamster/      cipher, initials, page scraper, sources, profiles, people, galleries
   tui/             app state, views, logo, theme, history, clipboard, event loop
 ```
 
@@ -305,7 +380,7 @@ cargo build --release
 cargo test
 ```
 
-The suite covers the muxer on hand-built fragmented, progressive and WebM files, an
+The suite covers the muxer on hand-built fragmented, progressive, WebM and Matroska files, an
 end-to-end download and merge against a local range server, player launching through
 stand-in player scripts, and every screen rendered at several terminal sizes. CI runs
 `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test` on Linux, then clippy and

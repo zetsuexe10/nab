@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -7,15 +7,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::hlsdl;
+use crate::http;
 use crate::layout::Folder;
-use crate::model::Photo;
+use crate::model::{Cover, Meta, Photo};
 use crate::mux;
 use crate::photos;
 use crate::util::{human_size, sanitize_filename};
 
-pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
+pub use crate::http::USER_AGENT;
 const CHUNK: u64 = 4 * 1024 * 1024;
 const WORKERS: usize = 6;
+const COVER_LIMIT: u64 = 12 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Remote {
@@ -30,12 +32,15 @@ pub enum Job {
         audio: Remote,
         title: String,
         id: String,
+        meta: Option<Meta>,
     },
     Video {
         video: Remote,
         audio: Option<Remote>,
+        wrap: Option<mux::Container>,
         title: String,
         id: String,
+        meta: Option<Meta>,
     },
     Gallery {
         photos: Vec<Photo>,
@@ -147,28 +152,42 @@ fn execute(
     fs::create_dir_all(dir).map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let pid = std::process::id();
     match job {
-        Job::Audio { audio, title, id } => {
+        Job::Audio {
+            audio,
+            title,
+            id,
+            meta,
+        } => {
             let stem = stem(title, id);
+            let meta = with_cover(meta.as_ref(), cancel);
             let part = dir.join(format!(".nab-{id}-{pid}.audio"));
             let cut = dir.join(format!(".nab-{id}-{pid}.cut"));
             let scratch = dir.join(format!(".nab-{id}-{pid}.segments"));
             let _temps = Temps(vec![part.clone(), cut.clone(), scratch.clone()]);
             let _ = tx.send(Msg::Stage(Stage::Fetching));
-            let Some(container) = fetch_any(audio, &part, &scratch, tx, cancel)? else {
+            let Some(_) = fetch_any(audio, &part, &scratch, tx, cancel)? else {
                 return Ok(None);
             };
             if !audio.extract {
-                let dest = unique_path(dir, &stem, &audio.ext, id);
-                save(&part, &dest)?;
+                let tagged = tag_in_place(&part, &cut, meta.as_ref(), tx);
+                let ext = if tagged {
+                    mux::sniff(&cut)
+                        .map(mux::Container::audio_extension)
+                        .unwrap_or(&audio.ext)
+                } else {
+                    &audio.ext
+                };
+                let dest = unique_path(dir, &stem, ext, id);
+                save(if tagged { &cut } else { &part }, &dest)?;
                 return Ok(Some(dest));
             }
-            if container != "mp4" {
-                return Err("audio can only be taken out of an mp4 stream".to_string());
-            }
             let _ = tx.send(Msg::Stage(Stage::Extracting));
-            mux::extract_audio(&part, &cut)
+            mux::extract_audio(&part, &cut, meta.as_ref())
                 .map_err(|error| format!("could not extract the audio: {error}"))?;
-            let dest = unique_path(dir, &stem, "m4a", id);
+            let extension = mux::sniff(&cut)
+                .map(mux::Container::audio_extension)
+                .unwrap_or("m4a");
+            let dest = unique_path(dir, &stem, extension, id);
             save(&cut, &dest)?;
             Ok(Some(dest))
         }
@@ -203,10 +222,13 @@ fn execute(
         Job::Video {
             video,
             audio,
+            wrap,
             title,
             id,
+            meta,
         } => {
             let stem = stem(title, id);
+            let meta = with_cover(meta.as_ref(), cancel);
             let video_part = dir.join(format!(".nab-{id}-{pid}.video"));
             let audio_part = dir.join(format!(".nab-{id}-{pid}.audio"));
             let merged_part = dir.join(format!(".nab-{id}-{pid}.merged"));
@@ -235,8 +257,9 @@ fn execute(
                         "no audio track fits this container, saved video only".to_string(),
                     ));
                 }
+                let tagged = tag_in_place(&video_part, &merged_part, meta.as_ref(), tx);
                 let dest = unique_path(dir, &stem, &video.ext, id);
-                save(&video_part, &dest)?;
+                save(if tagged { &merged_part } else { &video_part }, &dest)?;
                 return Ok(Some(dest));
             };
             let _ = tx.send(Msg::Stage(Stage::FetchingAudio));
@@ -244,8 +267,14 @@ fn execute(
                 return Ok(None);
             }
             let _ = tx.send(Msg::Stage(Stage::Merging));
-            mux::merge(&video_part, &audio_part, &merged_part)
-                .map_err(|error| format!("could not merge audio and video: {error}"))?;
+            merge_streams(
+                &video_part,
+                &audio_part,
+                &merged_part,
+                *wrap,
+                meta.as_ref(),
+                tx,
+            )?;
             let container = mux::sniff(&merged_part)
                 .map(mux::Container::extension)
                 .unwrap_or_else(|_| mux::Container::for_video(&video.ext).extension());
@@ -254,6 +283,70 @@ fn execute(
             Ok(Some(dest))
         }
     }
+}
+
+fn merge_streams(
+    video: &Path,
+    audio: &Path,
+    out: &Path,
+    wrap: Option<mux::Container>,
+    meta: Option<&Meta>,
+    tx: &Sender<Msg>,
+) -> Result<(), String> {
+    if let Some(target) = wrap {
+        match mux::merge_into(video, audio, out, target, meta) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = tx.send(Msg::Note(format!(
+                    "could not save as {}: {error}",
+                    target.extension()
+                )));
+            }
+        }
+    }
+    mux::merge(video, audio, out, meta)
+        .map_err(|error| format!("could not merge audio and video: {error}"))
+}
+
+fn tag_in_place(source: &Path, out: &Path, meta: Option<&Meta>, tx: &Sender<Msg>) -> bool {
+    let Some(meta) = meta.filter(|meta| !meta.is_empty()) else {
+        return false;
+    };
+    match mux::retag(source, out, meta) {
+        Ok(()) => true,
+        Err(error) => {
+            let _ = fs::remove_file(out);
+            let _ = tx.send(Msg::Note(format!("saved without tags: {error}")));
+            false
+        }
+    }
+}
+
+fn with_cover(meta: Option<&Meta>, cancel: &AtomicBool) -> Option<Meta> {
+    let mut meta = meta.cloned()?;
+    if meta.cover.is_none() {
+        for url in &meta.cover_urls {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if let Some(cover) = fetch_cover(url) {
+                meta.cover = Some(cover);
+                break;
+            }
+        }
+    }
+    Some(meta)
+}
+
+fn fetch_cover(url: &str) -> Option<Cover> {
+    let mut response = http::get(url, None, None).ok()?;
+    let data = response
+        .body_mut()
+        .with_config()
+        .limit(COVER_LIMIT)
+        .read_to_vec()
+        .ok()?;
+    Cover::sniff(data)
 }
 
 fn fetch_any(
@@ -272,16 +365,6 @@ fn fetch_any(
     Ok(Some(if remote.ext == "mp4" { "mp4" } else { "other" }))
 }
 
-fn with_referer<B>(
-    request: ureq::RequestBuilder<B>,
-    referer: Option<&str>,
-) -> ureq::RequestBuilder<B> {
-    match referer {
-        Some(referer) => request.header("referer", referer),
-        None => request,
-    }
-}
-
 fn save(part: &Path, dest: &Path) -> Result<(), String> {
     fs::rename(part, dest).map_err(|error| format!("cannot save {}: {error}", dest.display()))
 }
@@ -297,15 +380,7 @@ fn fetch(
     }
     let url = remote.url.as_str();
     let referer = remote.referer.as_deref();
-    let mut response = with_referer(
-        ureq::get(url)
-            .header("user-agent", USER_AGENT)
-            .header("accept", "*/*")
-            .header("range", "bytes=0-"),
-        referer,
-    )
-    .call()
-    .map_err(|error| format!("download failed: {error}"))?;
+    let mut response = http::get(url, referer, Some((0, None)))?;
     let ranged = response.status().as_u16() == 206;
     let total = response
         .headers()
@@ -321,26 +396,15 @@ fn fetch(
         return fetch_segments(url, referer, dest, total, tx, cancel);
     }
     let mut reader = response.body_mut().as_reader();
-    let file = File::create(dest).map_err(|error| format!("cannot write download: {error}"))?;
-    let mut writer = BufWriter::new(file);
-    let mut buffer = [0u8; 65536];
-    let mut written = 0u64;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(false);
-        }
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("download failed: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        writer
-            .write_all(&buffer[..read])
-            .map_err(|error| format!("cannot write download: {error}"))?;
-        written += read as u64;
-        let _ = tx.send(Msg::Progress(written));
-    }
+    let mut writer = BufWriter::new(create(dest)?);
+    let mut running = 0u64;
+    let Some(written) = http::pump(&mut reader, &mut writer, cancel, |read| {
+        running += read;
+        let _ = tx.send(Msg::Progress(running));
+    })?
+    else {
+        return Ok(false);
+    };
     writer
         .flush()
         .map_err(|error| format!("cannot write download: {error}"))?;
@@ -348,6 +412,10 @@ fn fetch(
         return Err("download ended early".to_string());
     }
     Ok(true)
+}
+
+fn create(path: &Path) -> Result<File, String> {
+    File::create(path).map_err(|error| format!("cannot write download: {error}"))
 }
 
 fn fetch_segments(
@@ -358,10 +426,9 @@ fn fetch_segments(
     tx: &Sender<Msg>,
     cancel: &AtomicBool,
 ) -> Result<bool, String> {
-    let file = File::create(dest).map_err(|error| format!("cannot write download: {error}"))?;
-    file.set_len(total)
+    create(dest)?
+        .set_len(total)
         .map_err(|error| format!("cannot write download: {error}"))?;
-    drop(file);
     let segments = total.div_ceil(CHUNK) as usize;
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
@@ -384,7 +451,19 @@ fn fetch_segments(
                 }
                 let start = index as u64 * CHUNK;
                 let end = (start + CHUNK).min(total) - 1;
-                if let Err(error) = fetch_segment(url, referer, dest, start, end, &tx, done) {
+                let outcome = http::retry(cancel, || {
+                    let mut taken = 0u64;
+                    let result = fetch_segment(url, referer, dest, start, end, cancel, |read| {
+                        taken += read;
+                        let progress = done.fetch_add(read, Ordering::Relaxed) + read;
+                        let _ = tx.send(Msg::Progress(progress));
+                    });
+                    if !matches!(result, Ok(Some(()))) {
+                        done.fetch_sub(taken, Ordering::Relaxed);
+                    }
+                    result
+                });
+                if let Err(error) = outcome {
                     if failure.lock().map(|mut slot| slot.replace(error)).is_ok() {
                         stopped.store(true, Ordering::Relaxed);
                     }
@@ -412,18 +491,10 @@ fn fetch_segment(
     dest: &Path,
     start: u64,
     end: u64,
-    tx: &Sender<Msg>,
-    done: &AtomicU64,
-) -> Result<(), String> {
-    let mut response = with_referer(
-        ureq::get(url)
-            .header("user-agent", USER_AGENT)
-            .header("accept", "*/*")
-            .header("range", format!("bytes={start}-{end}")),
-        referer,
-    )
-    .call()
-    .map_err(|error| format!("download failed: {error}"))?;
+    cancel: &AtomicBool,
+    seen: impl FnMut(u64),
+) -> Result<Option<()>, String> {
+    let mut response = http::get(url, referer, Some((start, Some(end))))?;
     if response.status().as_u16() != 206 {
         return Err("the server stopped honouring range requests".to_string());
     }
@@ -436,23 +507,16 @@ fn fetch_segment(
         .seek(SeekFrom::Start(start))
         .map_err(|error| format!("cannot write download: {error}"))?;
     let mut reader = response.body_mut().as_reader();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|error| format!("download failed: {error}"))?;
-        if read == 0 {
-            break;
-        }
-        writer
-            .write_all(&buffer[..read])
-            .map_err(|error| format!("cannot write download: {error}"))?;
-        let progress = done.fetch_add(read as u64, Ordering::Relaxed) + read as u64;
-        let _ = tx.send(Msg::Progress(progress));
-    }
+    let Some(written) = http::pump(&mut reader, &mut writer, cancel, seen)? else {
+        return Ok(None);
+    };
     writer
         .flush()
-        .map_err(|error| format!("cannot write download: {error}"))
+        .map_err(|error| format!("cannot write download: {error}"))?;
+    if written != end - start + 1 {
+        return Err("download ended early".to_string());
+    }
+    Ok(Some(()))
 }
 
 fn stem(title: &str, id: &str) -> String {
@@ -597,8 +661,10 @@ mod tests {
                 referer: None,
                 extract: false,
             }),
+            wrap: None,
             title: "My: clip".to_string(),
             id: "abcdefghijk".to_string(),
+            meta: None,
         };
         run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
         let (stages, notes, done) = collect(rx);
@@ -623,6 +689,78 @@ mod tests {
     }
 
     #[test]
+    fn saves_the_merged_pair_as_matroska_on_request() {
+        let (base, video, audio) = served();
+        let dir = std::env::temp_dir().join(format!("nab-e2e-mkv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Video {
+            video: Remote {
+                url: format!("{base}/v.mp4"),
+                ext: "mp4".to_string(),
+                referer: None,
+                extract: false,
+            },
+            audio: Some(Remote {
+                url: format!("{base}/a.m4a"),
+                ext: "m4a".to_string(),
+                referer: None,
+                extract: false,
+            }),
+            wrap: Some(mux::Container::Mkv),
+            title: "wrapped".to_string(),
+            id: "abcdefghijk".to_string(),
+            meta: None,
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (_, notes, done) = collect(rx);
+        assert!(notes.is_empty());
+        let path = done.unwrap();
+        assert_eq!(path.file_name().unwrap(), "wrapped.mkv");
+        assert_eq!(
+            mux::track_counts(&path).unwrap(),
+            (video.len(), audio.len())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_impossible_format_falls_back_with_a_note() {
+        let (base, video, audio) = served();
+        let dir = std::env::temp_dir().join(format!("nab-e2e-fallback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Video {
+            video: Remote {
+                url: format!("{base}/v.mp4"),
+                ext: "mp4".to_string(),
+                referer: None,
+                extract: false,
+            },
+            audio: Some(Remote {
+                url: format!("{base}/a.m4a"),
+                ext: "m4a".to_string(),
+                referer: None,
+                extract: false,
+            }),
+            wrap: Some(mux::Container::WebM),
+            title: "fallback".to_string(),
+            id: "abcdefghijk".to_string(),
+            meta: None,
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (_, notes, done) = collect(rx);
+        assert_eq!(notes.len(), 1);
+        let path = done.unwrap();
+        assert_eq!(path.file_name().unwrap(), "fallback.mp4");
+        assert_eq!(
+            mux::track_counts(&path).unwrap(),
+            (video.len(), audio.len())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unpaired_audio_saves_video_with_a_note() {
         let (base, video, _) = served();
         let dir = std::env::temp_dir().join(format!("nab-e2e-solo-{}", std::process::id()));
@@ -641,8 +779,10 @@ mod tests {
                 referer: None,
                 extract: false,
             }),
+            wrap: None,
             title: "solo".to_string(),
             id: "abcdefghijk".to_string(),
+            meta: None,
         };
         run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
         let (_, notes, done) = collect(rx);
@@ -678,8 +818,10 @@ mod tests {
                 referer: None,
                 extract: false,
             }),
+            wrap: None,
             title: "bad".to_string(),
             id: "abcdefghijk".to_string(),
+            meta: None,
         };
         run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
         let failure = rx.into_iter().find_map(|message| match message {
@@ -727,8 +869,10 @@ mod tests {
                 extract: false,
             },
             audio: None,
+            wrap: None,
             title: "Stream: clip".to_string(),
             id: "abc".to_string(),
+            meta: None,
         }
     }
 
@@ -848,6 +992,7 @@ mod tests {
             &both.join("v.mp4"),
             &both.join("a.m4a"),
             &both.join("j.mp4"),
+            None,
         )
         .unwrap();
         let joined = fs::read(both.join("j.mp4")).unwrap();
@@ -865,6 +1010,7 @@ mod tests {
             },
             title: "clip".to_string(),
             id: "abcdefghijk".to_string(),
+            meta: None,
         };
         run(job, both.clone(), tx, Arc::new(AtomicBool::new(false)));
         let (stages, _, done) = collect(rx);
@@ -949,6 +1095,129 @@ mod tests {
             }
         }
         assert!(failed);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tagged_meta(base: &str) -> Meta {
+        Meta {
+            title: Some("Blue Hour".into()),
+            artist: Some("Ana Lima".into()),
+            album: Some("Night Shift".into()),
+            cover_urls: vec![format!("{base}/missing.jpg"), format!("{base}/cover.jpg")],
+            ..Meta::default()
+        }
+    }
+
+    fn cover_bytes() -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0];
+        bytes.extend_from_slice(&[7u8; 64]);
+        bytes
+    }
+
+    fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+        bytes.windows(needle.len()).any(|window| window == needle)
+    }
+
+    #[test]
+    fn audio_is_tagged_with_the_first_cover_that_downloads() {
+        let audio = mux::synth::frames(false, 9, 2);
+        let base = crate::testserver::serve(vec![
+            (
+                "/a.m4a".to_string(),
+                mux::synth::fragmented(false, &audio, 44100, 1024),
+            ),
+            ("/cover.jpg".to_string(), cover_bytes()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("nab-tag-audio-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Audio {
+            audio: Remote {
+                url: format!("{base}/a.m4a"),
+                ext: "m4a".to_string(),
+                referer: None,
+                extract: false,
+            },
+            title: "Blue Hour".to_string(),
+            id: "abcdefghijk".to_string(),
+            meta: Some(tagged_meta(&base)),
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (_, notes, done) = collect(rx);
+        let path = done.unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(path.file_name().unwrap(), "Blue Hour.m4a");
+        let bytes = fs::read(&path).unwrap();
+        assert!(contains(&bytes, b"Night Shift"));
+        assert!(contains(&bytes, b"covr"));
+        assert!(contains(&bytes, &cover_bytes()));
+        let hidden = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".nab"))
+            .count();
+        assert_eq!(hidden, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merged_video_carries_the_tags() {
+        let (base, _, _) = served();
+        let dir = std::env::temp_dir().join(format!("nab-tag-video-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Video {
+            video: Remote {
+                url: format!("{base}/v.mp4"),
+                ext: "mp4".to_string(),
+                referer: None,
+                extract: false,
+            },
+            audio: Some(Remote {
+                url: format!("{base}/a.m4a"),
+                ext: "m4a".to_string(),
+                referer: None,
+                extract: false,
+            }),
+            wrap: None,
+            title: "tagged".to_string(),
+            id: "abcdefghijk".to_string(),
+            meta: Some(tagged_meta(&base)),
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (_, notes, done) = collect(rx);
+        let path = done.unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+        let bytes = fs::read(&path).unwrap();
+        assert!(contains(&bytes, b"Blue Hour"));
+        assert!(!contains(&bytes, b"covr"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_tagged_is_saved_untouched_with_a_note() {
+        let junk = vec![9u8; 4000];
+        let base = crate::testserver::serve(vec![("/a.m4a".to_string(), junk.clone())]);
+        let dir = std::env::temp_dir().join(format!("nab-tag-junk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (tx, rx) = mpsc::channel();
+        let job = Job::Audio {
+            audio: Remote {
+                url: format!("{base}/a.m4a"),
+                ext: "m4a".to_string(),
+                referer: None,
+                extract: false,
+            },
+            title: "junk".to_string(),
+            id: "abcdefghijk".to_string(),
+            meta: Some(tagged_meta(&base)),
+        };
+        run(job, dir.clone(), tx, Arc::new(AtomicBool::new(false)));
+        let (_, notes, done) = collect(rx);
+        let path = done.unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("without tags"));
+        assert_eq!(fs::read(&path).unwrap(), junk);
         let _ = fs::remove_dir_all(&dir);
     }
 }

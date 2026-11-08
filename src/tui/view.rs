@@ -270,6 +270,13 @@ impl App {
                     hints.push(hint("c", "comments"));
                     hints.push(hint("r", "related"));
                 }
+                if self
+                    .sources
+                    .as_ref()
+                    .is_some_and(|sources| sources.cast.iter().any(|credit| credit.is_person()))
+                {
+                    hints.push(hint("a", "cast"));
+                }
                 if self.providers().len() > 1 {
                     hints.push(hint("⇥", self.provider.unwrap_or("source")));
                 }
@@ -295,6 +302,9 @@ impl App {
             }
         }
         hints.push(hint("^t", format!("theme:{}", self.theme.label())));
+        if self.mode == Mode::Query {
+            hints.push(hint("^f", format!("save:{}", self.format_label())));
+        }
         hints
     }
 
@@ -383,7 +393,10 @@ impl App {
             area.width,
             Line::styled(
                 fit(
-                    "audio · video · mpv · vlc · built-in muxer, no ffmpeg",
+                    &format!(
+                        "audio · video · galleries · mpv · vlc · saves as {}",
+                        self.format_label()
+                    ),
                     area.width as usize,
                 ),
                 theme.soft(),
@@ -824,6 +837,11 @@ impl App {
         } else {
             video.title.clone()
         };
+        let title = match video.media {
+            Media::Person => format!("★ {title}"),
+            Media::Gallery => format!("▣ {title}"),
+            Media::Video => title,
+        };
         let title_style = if selected { theme.pick() } else { theme.bold() };
         let first = Line::from(vec![
             Span::styled(marker, theme.pick()),
@@ -870,7 +888,7 @@ impl App {
             lines.push(second);
         }
         let name = match &self.related_of {
-            Some(title) => format!("Related to {title}"),
+            Some(label) => label.clone(),
             None if self.scope == Scope::Stars => "Stars".to_string(),
             None => "Results".to_string(),
         };
@@ -1012,6 +1030,58 @@ impl App {
             let meta = join(&[&video.channel, &video.duration, &video.views]);
             if !meta.is_empty() {
                 lines.push(Line::styled(fit(&format!("▸ {meta}"), room), theme.soft()));
+            }
+        }
+        if let Some(sources) = &self.sources {
+            if let Some(rating) = &sources.rating {
+                lines.push(Line::styled(
+                    fit(&format!("▸ {rating}"), room),
+                    theme.soft(),
+                ));
+            }
+            let names = |wanted: &dyn Fn(&crate::source::Credit) -> bool| -> String {
+                sources
+                    .cast
+                    .iter()
+                    .filter(|credit| wanted(credit))
+                    .map(|credit| credit.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let cast = names(&|credit| matches!(credit.kind, "pornstar" | "celebrity"));
+            let channels = names(&|credit| matches!(credit.kind, "creator" | "channel" | "user"));
+            for (label, value) in [("cast", cast), ("channel", channels)] {
+                if value.is_empty() {
+                    continue;
+                }
+                for (row, text) in wrap(&value, room.saturating_sub(10).max(8))
+                    .into_iter()
+                    .take(6)
+                    .enumerate()
+                {
+                    let head = if row == 0 {
+                        format!("▸ {label}: ")
+                    } else {
+                        "▸ ".to_string()
+                    };
+                    lines.push(Line::styled(
+                        fit(&format!("{head}{text}"), room),
+                        theme.soft(),
+                    ));
+                }
+            }
+            if !sources.tags.is_empty() {
+                let tags = sources
+                    .tags
+                    .iter()
+                    .take(8)
+                    .map(|tag| tag.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(Line::styled(
+                    fit(&format!("▸ tags: {tags}"), room),
+                    theme.soft(),
+                ));
             }
         }
         if let Some(provider) = self.provider {
@@ -1303,14 +1373,14 @@ impl App {
         };
         let lead_width = lead
             .as_ref()
-            .map(|text| width(text) + SEPARATOR.len() - 2)
+            .map(|text| width(text) + width(SEPARATOR))
             .unwrap_or(0);
         let measure = |hints: &[Hint]| -> usize {
             let items: usize = hints
                 .iter()
                 .map(|item| width(&item.key) + 1 + width(&item.label))
                 .sum();
-            items + hints.len().saturating_sub(1) * (SEPARATOR.len() - 2) + lead_width
+            items + hints.len().saturating_sub(1) * width(SEPARATOR) + lead_width
         };
         while hints.len() > 1 && measure(&hints) > area.width as usize {
             hints.pop();
@@ -1318,6 +1388,7 @@ impl App {
         let total = measure(&hints);
         let mut column = area.x + (area.width as usize).saturating_sub(total) as u16 / 2;
         let soft = theme.soft();
+        let sep = width(SEPARATOR) as u16;
         if let Some(text) = lead {
             let used = width(&text) as u16;
             put(
@@ -1331,13 +1402,13 @@ impl App {
                 ]),
             );
             column += used;
-            put(frame, column, y, 5, Line::styled(SEPARATOR, soft));
-            column += 5;
+            put(frame, column, y, sep, Line::styled(SEPARATOR, soft));
+            column += sep;
         }
         for (index, item) in hints.iter().enumerate() {
             if index > 0 {
-                put(frame, column, y, 5, Line::styled(SEPARATOR, soft));
-                column += 5;
+                put(frame, column, y, sep, Line::styled(SEPARATOR, soft));
+                column += sep;
             }
             let used = (width(&item.key) + 1 + width(&item.label)) as u16;
             put(
@@ -1669,5 +1740,27 @@ mod tests {
         assert!(screen.contains("❯ Amy · ♥ 5"));
         assert!(screen.contains("  Bea"));
         assert!(screen.contains("^c quit") && screen.contains("esc back"));
+    }
+
+    #[test]
+    fn side_panel_lists_cast_channel_tags_and_rating() {
+        use crate::source::Credit;
+        let mut app = app();
+        let credit = |name: &str, kind: &'static str| Credit {
+            name: name.to_string(),
+            url: format!("https://xhamster.com/x/{name}"),
+            kind,
+        };
+        let sources = app.sources.as_mut().unwrap();
+        sources.cast = vec![credit("Amy", "pornstar"), credit("Studio X", "channel")];
+        sources.tags = vec![credit("Blonde", "tag")];
+        sources.rating = Some("90% liked".to_string());
+        app.mode = Mode::Formats;
+        let screen = draw(&mut app, 110, 30);
+        assert!(screen.contains("▸ cast: Amy"));
+        assert!(screen.contains("▸ channel: Studio X"));
+        assert!(screen.contains("▸ tags: Blonde"));
+        assert!(screen.contains("▸ 90% liked"));
+        assert!(screen.contains("a cast"));
     }
 }
