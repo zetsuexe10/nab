@@ -3,6 +3,7 @@ mod clip;
 #[cfg(test)]
 mod fixture;
 mod logo;
+mod shaped;
 mod store;
 mod theme;
 pub use theme::ThemeMode;
@@ -20,7 +21,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::layout::Layout;
@@ -28,7 +28,7 @@ use crate::play::{self, Player};
 use crate::sites::Site;
 use app::{App, Flow, Mode};
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term = Terminal<shaped::Shaped<Stdout>>;
 
 fn failure(error: impl std::fmt::Display) -> String {
     format!("terminal error: {error}")
@@ -44,7 +44,7 @@ fn setup() -> Result<Term, String> {
         Hide
     )
     .map_err(failure)?;
-    Terminal::new(CrosstermBackend::new(stdout())).map_err(failure)
+    Terminal::new(shaped::Shaped::new(stdout(), shaped::supported())).map_err(failure)
 }
 
 fn teardown() -> Result<(), String> {

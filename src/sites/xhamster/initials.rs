@@ -371,8 +371,8 @@ pub fn blocked(initials: &Value) -> bool {
     {
         return false;
     }
-    !(paging(initials).last > 1
-        || !array(initials, "layoutPage.pornstarListProps.pornstars").is_empty())
+    paging(initials).last <= 1
+        && array(initials, "layoutPage.pornstarListProps.pornstars").is_empty()
 }
 
 fn credit_kind(tag: &Value, url: &str) -> &'static str {

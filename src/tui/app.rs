@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::clip;
 use super::store::Store;
@@ -198,7 +199,7 @@ impl App {
             .into_iter()
             .filter(|candidate| play::locate(*candidate).is_some())
             .collect();
-        let caret = query.chars().count();
+        let caret = query.len();
         App {
             site: Site::first(),
             scope: Scope::Videos,
@@ -542,7 +543,7 @@ impl App {
     pub fn start_search(&mut self, query: String) {
         self.ticket += 1;
         self.query = query.clone();
-        self.caret = self.query.chars().count();
+        self.caret = self.query.len();
         self.results.clear();
         self.cursor = None;
         self.trail.clear();
@@ -1127,9 +1128,8 @@ impl App {
         if cleaned.is_empty() {
             return Flow::Continue;
         }
-        let at = self.byte_at(self.caret);
-        self.query.insert_str(at, &cleaned);
-        self.caret += cleaned.chars().count();
+        self.query.insert_str(self.caret, &cleaned);
+        self.caret += cleaned.len();
         self.clip_taken = true;
         if clip::link(&self.query).is_some() {
             self.submit();
@@ -1254,20 +1254,24 @@ impl App {
                     self.mode = Mode::Results;
                 }
             }
-            KeyCode::Left => self.caret = self.caret.saturating_sub(1),
-            KeyCode::Right => self.caret = (self.caret + 1).min(self.len()),
+            KeyCode::Left => self.caret = self.previous(),
+            KeyCode::Right => self.caret = self.next(),
             KeyCode::Home => self.caret = 0,
             KeyCode::End => self.caret = self.len(),
             KeyCode::Backspace => {
-                if self.caret > 0 {
-                    self.remove(self.caret - 1, self.caret);
-                    self.caret -= 1;
+                let start = self.previous();
+                if start < self.caret {
+                    self.remove(start, self.caret);
+                    self.caret = start;
                     self.edited();
                 }
             }
             KeyCode::Delete => {
-                self.remove(self.caret, self.caret + 1);
-                self.edited();
+                let end = self.next();
+                if end > self.caret {
+                    self.remove(self.caret, end);
+                    self.edited();
+                }
             }
             KeyCode::Char('a') if control => self.caret = 0,
             KeyCode::Char('e') if control => self.caret = self.len(),
@@ -1283,22 +1287,14 @@ impl App {
                 self.edited();
             }
             KeyCode::Char('w') if control => {
-                let chars: Vec<char> = self.query.chars().collect();
-                let mut start = self.caret;
-                while start > 0 && chars[start - 1].is_whitespace() {
-                    start -= 1;
-                }
-                while start > 0 && !chars[start - 1].is_whitespace() {
-                    start -= 1;
-                }
+                let start = self.word();
                 self.remove(start, self.caret);
                 self.caret = start;
                 self.edited();
             }
             KeyCode::Char(character) if !control => {
-                let at = self.byte_at(self.caret);
-                self.query.insert(at, character);
-                self.caret += 1;
+                self.query.insert(self.caret, character);
+                self.caret += character.len_utf8();
                 self.edited();
             }
             _ => {}
@@ -1339,21 +1335,46 @@ impl App {
     }
 
     fn len(&self) -> usize {
-        self.query.chars().count()
+        self.query.len()
     }
 
-    fn byte_at(&self, chars: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(chars)
+    fn previous(&self) -> usize {
+        self.query[..self.caret.min(self.len())]
+            .grapheme_indices(true)
+            .next_back()
             .map(|(index, _)| index)
-            .unwrap_or(self.query.len())
+            .unwrap_or(0)
+    }
+
+    fn next(&self) -> usize {
+        let caret = self.caret.min(self.len());
+        self.query[caret..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(index, _)| caret + index)
+            .unwrap_or_else(|| self.len())
+    }
+
+    fn word(&self) -> usize {
+        let prefix = &self.query[..self.caret.min(self.len())];
+        let mut start = prefix.trim_end_matches(char::is_whitespace).len();
+        start = prefix[..start]
+            .rfind(char::is_whitespace)
+            .map(|index| {
+                index
+                    + prefix[index..]
+                        .chars()
+                        .next()
+                        .map(char::len_utf8)
+                        .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        start
     }
 
     fn remove(&mut self, from: usize, to: usize) {
-        let (a, b) = (self.byte_at(from), self.byte_at(to.min(self.len())));
-        if a < b {
-            self.query.replace_range(a..b, "");
+        if from < to {
+            self.query.replace_range(from..to, "");
         }
     }
 
@@ -2054,6 +2075,27 @@ mod tests {
         press(&mut app, KeyCode::Backspace);
         press(&mut app, KeyCode::Delete);
         assert_eq!(app.query, "");
+    }
+
+    #[test]
+    fn edits_bengali_by_graphemes() {
+        let mut app = sample();
+        empty_query(&mut app);
+        type_text(&mut app, "ভুতের");
+        assert_eq!(app.query, "ভুতের");
+        assert_eq!(app.caret, "ভুতের".len());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.query, "ভুতে");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.query, "ভু");
+        assert_eq!(app.caret, "ভু".len());
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.caret, 0);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.caret, "ভু".len());
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.query, "");
+        assert_eq!(app.caret, 0);
     }
 
     #[test]

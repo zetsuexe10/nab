@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::app::{App, Hit, Mode, Zone, SUGGEST_MAX};
 use super::logo;
@@ -56,28 +57,25 @@ fn hint(key: &str, label: impl Into<String>) -> Hint {
 }
 
 fn window(text: &str, caret: usize, room: usize) -> (String, u16) {
-    let chars: Vec<char> = text.chars().collect();
-    let cells = |slice: &[char]| -> usize {
-        slice
-            .iter()
-            .map(|character| width(&character.to_string()))
-            .sum()
-    };
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let widths: Vec<usize> = graphemes.iter().map(|grapheme| width(grapheme)).collect();
+    let caret = caret.min(text.len());
+    let end = text[..caret].graphemes(true).count();
     let mut start = 0usize;
-    while start < caret && cells(&chars[start..caret]) >= room {
+    while start < end && widths[start..end].iter().sum::<usize>() >= room {
         start += 1;
     }
     let mut shown = String::new();
     let mut used = 0usize;
-    for character in &chars[start..] {
-        let step = width(&character.to_string());
+    for (index, grapheme) in graphemes.iter().enumerate().skip(start) {
+        let step = widths[index];
         if used + step > room {
             break;
         }
-        shown.push(*character);
+        shown.push_str(grapheme);
         used += step;
     }
-    (shown, cells(&chars[start..caret]) as u16)
+    (shown, widths[start..end].iter().sum::<usize>() as u16)
 }
 
 fn rect(area: Rect, x: u16, y: u16, wide: u16, tall: u16) -> Rect {
@@ -1658,7 +1656,7 @@ mod tests {
                     app.choice = 2;
                     app.sel = 8;
                     app.query = "a fairly long query that has to scroll inside the frame".into();
-                    app.caret = app.query.chars().count();
+                    app.caret = app.query.len();
                     app.notice = Some(("note".into(), std::time::Instant::now()));
                     draw(&mut app, wide, tall);
                 }
@@ -1724,6 +1722,18 @@ mod tests {
         assert_eq!(column, 4);
         let (shown, column) = window("abcdefghij", 3, 5);
         assert_eq!(shown, "abcde");
+        assert_eq!(column, 3);
+    }
+
+    #[test]
+    fn window_scrolls_on_grapheme_boundaries() {
+        let text = "ভুতের ক্লাব";
+        let caret = "ভুতের".len();
+        let (shown, column) = window(text, caret, 10);
+        assert_eq!(shown, text);
+        assert_eq!(column, 4);
+        let (shown, column) = window(text, caret, 4);
+        assert_eq!(shown, "তের ");
         assert_eq!(column, 3);
     }
 

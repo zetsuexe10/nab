@@ -1,5 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThemeMode {
@@ -148,12 +149,12 @@ pub fn fit(text: &str, room: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for character in text.chars() {
-        let step = UnicodeWidthChar::width(character).unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let step = width(grapheme);
         if used + step + 1 > room {
             break;
         }
-        out.push(character);
+        out.push_str(grapheme);
         used += step;
     }
     out.push('…');
@@ -201,14 +202,29 @@ pub fn wrap(text: &str, room: usize) -> Vec<String> {
             if width(&line) <= room {
                 vec![line]
             } else {
-                line.chars()
-                    .collect::<Vec<_>>()
-                    .chunks(room.max(1))
-                    .map(|chunk| chunk.iter().collect::<String>())
-                    .collect()
+                break_graphemes(&line, room.max(1))
             }
         })
         .collect()
+}
+
+fn break_graphemes(line: &str, room: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for grapheme in line.graphemes(true) {
+        let step = width(grapheme);
+        if used + step > room && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push_str(grapheme);
+        used += step;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 pub fn clock(seconds: u64) -> String {
@@ -232,4 +248,24 @@ pub fn tilde(path: &std::path::Path) -> String {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_keeps_graphemes_whole() {
+        assert_eq!(fit("ভুতের", 4), "ভুতের");
+        assert_eq!(fit("ভুতের", 3), "ভু…");
+        assert_eq!(fit("ভুতের", 1), "…");
+        assert_eq!(width(&fit("ভুতের ক্লাব", 6)), 6);
+        assert!(fit("ভুতের ক্লাব", 6).starts_with("ভুতের"));
+    }
+
+    #[test]
+    fn wrap_breaks_graphemes_not_scalars() {
+        assert_eq!(wrap("ভুতের ক্লাব", 5), ["ভুতের", "ক্লাব"]);
+        assert_eq!(wrap("ভুতের", 3), ["ভুতে", "র"]);
+    }
 }
