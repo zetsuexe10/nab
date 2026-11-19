@@ -703,9 +703,14 @@ impl App {
         let last = (self.pscroll + rows).min(count);
         let mut lines = Vec::new();
         if let Some(profile) = &self.profile {
-            for index in self.pscroll..last {
-                let [first, second] =
-                    self.result_rows(&profile.videos[index], index == self.psel, inner);
+            for (index, video) in profile
+                .videos
+                .iter()
+                .enumerate()
+                .take(last)
+                .skip(self.pscroll)
+            {
+                let [first, second] = self.result_rows(video, index == self.psel, inner);
                 lines.push(first);
                 lines.push(second);
             }
